@@ -1,0 +1,17 @@
+[Unit]
+Description=GetaipilotBackEnd1 FastAPI — tg.getaipilot.in
+After=network.target
+
+[Service]
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/telesub
+EnvironmentFile=/var/www/telesub/.env
+ExecStart=/var/www/telesub/venv/bin/uvicorn Telesub:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

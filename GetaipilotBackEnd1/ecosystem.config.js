@@ -3,8 +3,8 @@ module.exports = {
     {
       name: "telegram-backend",
       script: "venv/bin/uvicorn",
-      args: "main:app --host 0.0.0.0 --port 8000",
-      cwd: "/var/www/bot-dashboard/backend",
+      args: "Telesub:app --host 127.0.0.1 --port 8000",
+      cwd: "/var/www/telesub",   // <-- update to your actual deploy path on the VPS
       instances: 1,
       autorestart: true,
       watch: false,
