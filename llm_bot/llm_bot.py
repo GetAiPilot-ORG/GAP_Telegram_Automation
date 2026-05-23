@@ -57,15 +57,28 @@ async def generate_llm_response(bot_id: str, user_message: str) -> str:
     if hasattr(config, "get"):
         provider = config.get("provider", "").lower()
         api_key = config.get("api_key")
-        business_info = config.get("business_info", "You are a helpful AI support bot.")
+        business_info = config.get("business_info", "")
         support_name = config.get("support_name", "AI Assistant")
+        # knowledge_base_text is the n8n-generated full system prompt
+        knowledge_base_text = config.get("knowledge_base_text") or ""
     else:
         provider = getattr(config, "provider", "").lower()
         api_key = getattr(config, "api_key", None)
-        business_info = getattr(config, "business_info", "You are a helpful AI support bot.")
+        business_info = getattr(config, "business_info", "")
         support_name = getattr(config, "support_name", "AI Assistant")
-    
-    system_prompt = f"Your name is {support_name}. {business_info}"
+        knowledge_base_text = getattr(config, "knowledge_base_text", "") or ""
+
+    # Priority:
+    # 1. knowledge_base_text  → written by n8n after generating the full KB system prompt
+    # 2. business_info        → raw user input (used before n8n has run, or as fallback)
+    # 3. Generic fallback
+    if knowledge_base_text.strip():
+        system_prompt = knowledge_base_text
+    elif business_info and len(business_info) > 200:
+        # Legacy: full prompt was stored directly in business_info
+        system_prompt = business_info
+    else:
+        system_prompt = f"Your name is {support_name}. {business_info or 'You are a helpful AI support assistant.'}"
     
     if not api_key:
         return "⚠️ Setup Error: The API key for this bot has not been configured."
@@ -166,6 +179,7 @@ async def bot_runner():
     while True:
         try:
             # Join chatbot_configs with telegram_tracker to get the bot_token
+            # Also fetch knowledge_base_text (n8n-generated full system prompt)
             query = supabase.table('chatbot_configs')\
                 .select('*, telegram_tracker(bot_token)')\
                 .eq('status', 'active')

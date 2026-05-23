@@ -1,7 +1,3 @@
-# this bot file is totaly working for gap joining bot
-# this is old FILE THAT IS NOT UPDATED AND IT IS MISSING THE BOT START STATUS ON THE DESHBOARD , AND ALSO NO INCLUDE REMINDER SENDING FUNCTIONALITY. in case if i update the code and got problem then i will use this file to revert back.
-
-
 import os
 import asyncio
 import datetime
