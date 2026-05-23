@@ -22,19 +22,20 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Allow overriding CORS origins via env (comma-separated)
+# Build CORS origins from env + safe defaults.
+# Important: keep localhost entries even when CORS_ORIGINS is set, so local
+# dashboards can call production backend during development.
 _env_origins = os.getenv("CORS_ORIGINS")
-if _env_origins:
-    origins = [o.strip() for o in _env_origins.split(",") if o.strip()]
-else:
-    origins = [
-        "https://getaipilot.in",
-        "https://www.getaipilot.in",
-        "https://api.getaipilot.in",
-        "http://localhost:8080",
-        "http://localhost:5173",
-        "http://127.0.0.1:8080",
-    ]
+_default_origins = [
+    "https://getaipilot.in",
+    "https://www.getaipilot.in",
+    "https://api.getaipilot.in",
+    "http://localhost:8080",
+    "http://localhost:5173",
+    "http://127.0.0.1:8080",
+]
+_env_origin_list = [o.strip() for o in (_env_origins or "").split(",") if o.strip()]
+origins = sorted(set(_default_origins + _env_origin_list))
 
 app.add_middleware(
     CORSMiddleware,
