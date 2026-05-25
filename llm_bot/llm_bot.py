@@ -151,7 +151,7 @@ async def get_or_create_telegram_session(bot_id: str, telegram_user_id: int, use
             
         # 2. If not found, create new session in chatbot_sessions
         query_insert_session = supabase.table('chatbot_sessions')\
-            .insert({})\
+            .insert({'status': 'active'})\
             .select('id')
             
         session_res = await run_supabase_query(query_insert_session)
