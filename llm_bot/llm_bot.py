@@ -136,6 +136,46 @@ async def generate_llm_response(bot_id: str, user_message: str) -> str:
             logger.error(f"LLM Error for bot {bot_id}: {e}")
             return "⚠️ An error occurred while generating a response. Please try again later."
 
+async def get_or_create_telegram_session(bot_id: str, telegram_user_id: int, user_name: str) -> str:
+    """Find or create a chatbot session for a Telegram user chatting with a specific bot."""
+    try:
+        # 1. Try to find existing session mapping
+        query_select = supabase.table('telegram_bot_sessions')\
+            .select('id')\
+            .eq('bot_id', bot_id)\
+            .eq('telegram_user_id', telegram_user_id)
+        
+        res = await run_supabase_query(query_select)
+        if res.data and len(res.data) > 0:
+            return res.data[0]['id']
+            
+        # 2. If not found, create new session in chatbot_sessions
+        query_insert_session = supabase.table('chatbot_sessions')\
+            .insert({})\
+            .select('id')
+            
+        session_res = await run_supabase_query(query_insert_session)
+        if not session_res.data or len(session_res.data) == 0:
+            raise ValueError("Failed to create chatbot session")
+            
+        session_id = session_res.data[0]['id']
+        
+        # 3. Create mapping in telegram_bot_sessions
+        query_insert_mapping = supabase.table('telegram_bot_sessions')\
+            .insert({
+                'id': session_id,
+                'bot_id': bot_id,
+                'telegram_user_id': telegram_user_id,
+                'user_name': user_name
+            })
+            
+        await run_supabase_query(query_insert_mapping)
+        return session_id
+        
+    except Exception as e:
+        logger.error(f"Error in get_or_create_telegram_session: {e}")
+        raise
+
 async def start_bot(config: dict):
     bot_id = config['bot_id']
     token = config['bot_token']
@@ -162,10 +202,58 @@ async def start_bot(config: dict):
             
             logger.info(f"LLM Bot {bot_id}: Received message from {user_id}: {user_message[:50]}...")
             
-            # Show "typing..." status
+            # Fetch sender details to construct user name
+            user_name = f"User {user_id}"
+            try:
+                sender = await event.get_sender()
+                if sender:
+                    first_name = getattr(sender, 'first_name', '') or ''
+                    last_name = getattr(sender, 'last_name', '') or ''
+                    username = getattr(sender, 'username', '') or ''
+                    
+                    full_name = f"{first_name} {last_name}".strip()
+                    if full_name:
+                        user_name = full_name
+                    elif username:
+                        user_name = username
+            except Exception as e:
+                logger.error(f"Failed to fetch sender profile: {e}")
+
+            # Get or create the mapped Supabase session ID
+            session_id = None
+            try:
+                session_id = await get_or_create_telegram_session(bot_id, user_id, user_name)
+            except Exception as e:
+                logger.error(f"Failed to resolve session ID for Telegram chat: {e}")
+
+            # Save the user's message to Supabase
+            if session_id:
+                try:
+                    user_msg_query = supabase.table('chatbot_messages').insert({
+                        'session_id': session_id,
+                        'role': 'user',
+                        'content': user_message
+                    })
+                    await run_supabase_query(user_msg_query)
+                except Exception as e:
+                    logger.error(f"Failed to save user message to Supabase: {e}")
+            
+            # Show "typing..." status and get response
             async with client.action(event.chat_id, 'typing'):
                 response = await generate_llm_response(bot_id, user_message)
                 await event.respond(response)
+                
+                # Save the bot's response to Supabase
+                if session_id:
+                    try:
+                        bot_msg_query = supabase.table('chatbot_messages').insert({
+                            'session_id': session_id,
+                            'role': 'assistant',
+                            'content': response
+                        })
+                        await run_supabase_query(bot_msg_query)
+                    except Exception as e:
+                        logger.error(f"Failed to save bot response to Supabase: {e}")
 
         active_clients[bot_id] = client
         await client.run_until_disconnected()
