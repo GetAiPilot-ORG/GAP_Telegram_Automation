@@ -90,6 +90,14 @@ async def start_bot(token: str, bot_id: str):
         @client.on(events.NewMessage(pattern=r'^/start(?: (.*))?'))
         async def on_user_joined(event):
             if not supabase: return # Added check
+            
+            # Smart check: If this bot has no active channel mappings, ignore /start!
+            # It means this is a pure AI chatbot, not a join bot.
+            mappings = GLOBAL_CHANNEL_MAPPINGS.get(bot_id, [])
+            if not mappings:
+                logger.info(f"Bot {bot_id}: Ignoring /start because it has no active channel mappings (pure support bot).")
+                return
+
             payload = event.pattern_match.group(1)
             sender = await event.get_sender()
             user_id = sender.id

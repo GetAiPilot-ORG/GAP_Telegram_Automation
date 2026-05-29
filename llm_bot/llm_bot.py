@@ -34,6 +34,9 @@ running_tasks = {}
 # Dictionary to cache the bot configurations from the database
 GLOBAL_BOT_CONFIGS = {} 
 
+# Global set of bot IDs that are currently active join bots (have channel mappings)
+GLOBAL_JOIN_BOT_IDS = set()
+
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "12345678"))
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "dummyhash")
 
@@ -199,9 +202,12 @@ async def start_bot(config: dict):
 
             user_message = event.message.text
 
-            # Ignore /start commands (which are handled separately by the Join Bot)
+            # Ignore /start commands ONLY IF this bot is also configured as a Join Bot (has active channel mappings)
             if user_message.strip().startswith('/start'):
-                return
+                if bot_id in GLOBAL_JOIN_BOT_IDS:
+                    logger.info(f"LLM Bot {bot_id}: Ignoring /start because it has active channel mappings (handled by Join Bot).")
+                    return
+                # Otherwise, let the LLM handle /start to welcome the user (pure support bot)
 
             user_id = event.sender_id
             
@@ -271,7 +277,20 @@ async def bot_runner():
     logger.info("LLM Bot Manager Started. Polling Supabase every 15 seconds for active chatbot configs...")
     while True:
         try:
-            # Join chatbot_configs with telegram_tracker to get the bot_token
+            # 1. Fetch active channel mappings to identify join bots
+            try:
+                mappings_query = supabase.table('bot_channel_mappings').select('bot_id').eq('status', 'Active')
+                mappings_res = await run_supabase_query(mappings_query)
+                GLOBAL_JOIN_BOT_IDS.clear()
+                if mappings_res.data:
+                    for m in mappings_res.data:
+                        if m.get('bot_id'):
+                            GLOBAL_JOIN_BOT_IDS.add(m['bot_id'])
+                logger.info(f"Active Join Bot IDs in database: {list(GLOBAL_JOIN_BOT_IDS)}")
+            except Exception as map_err:
+                logger.error(f"Error fetching channel mappings for LLM Bot Manager: {map_err}")
+
+            # 2. Join chatbot_configs with telegram_tracker to get the bot_token
             # Also fetch knowledge_base_text (n8n-generated full system prompt)
             query = supabase.table('chatbot_configs')\
                 .select('*, telegram_tracker(bot_token)')\
