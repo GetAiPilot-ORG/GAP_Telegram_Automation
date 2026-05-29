@@ -198,6 +198,11 @@ async def start_bot(config: dict):
                 return
 
             user_message = event.message.text
+
+            # Ignore /start commands (which are handled separately by the Join Bot)
+            if user_message.strip().startswith('/start'):
+                return
+
             user_id = event.sender_id
             
             logger.info(f"LLM Bot {bot_id}: Received message from {user_id}: {user_message[:50]}...")
