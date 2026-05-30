@@ -51,8 +51,8 @@ async def run_supabase_query(query):
 if not os.path.exists("sessions"):
     os.makedirs("sessions")
 
-async def generate_llm_response(bot_id: str, user_message: str, session_id: str = None) -> str:
-    """Generate a response using the configured LLM API key and optional conversation history."""
+async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id: int = None) -> str:
+    """Generate a response using the configured LLM API key and conversation history from telegram_chat_messages."""
     config = GLOBAL_BOT_CONFIGS.get(bot_id)
     if not config:
         return "Sorry, my configuration is currently unavailable."
@@ -86,29 +86,30 @@ async def generate_llm_response(bot_id: str, user_message: str, session_id: str 
     if not api_key:
         return "⚠️ Setup Error: The API key for this bot has not been configured."
 
-    logger.info(f"generate_llm_response called: bot_id={bot_id}, session_id={session_id}, user_message={user_message[:50]}")
+    logger.info(f"generate_llm_response called: bot_id={bot_id}, telegram_user_id={telegram_user_id}, user_message={user_message[:50]}")
 
-    # Fetch conversation history from Supabase
+    # Fetch conversation history from dedicated telegram_chat_messages table
     history = []
-    if session_id:
+    if telegram_user_id:
         try:
-            history_query = supabase.table('chatbot_messages')\
+            history_query = supabase.table('telegram_chat_messages')\
                 .select('role, content')\
-                .eq('session_id', session_id)\
+                .eq('bot_id', bot_id)\
+                .eq('telegram_user_id', telegram_user_id)\
                 .order('created_at', desc=True)\
                 .limit(20)
             res = await run_supabase_query(history_query)
             if res.data:
                 history = list(reversed(res.data))
-                logger.info(f"Fetched {len(history)} messages from history for session {session_id}.")
+                logger.info(f"Fetched {len(history)} messages from dedicated telegram_chat_messages history for user {telegram_user_id}.")
                 for idx, msg in enumerate(history):
                     logger.info(f"  History msg [{idx}] - {msg.get('role')}: {msg.get('content')[:60]}...")
             else:
-                logger.warning(f"No history messages found for session {session_id} in chatbot_messages.")
+                logger.warning(f"No history messages found for user {telegram_user_id} in telegram_chat_messages.")
         except Exception as e:
-            logger.error(f"Failed to fetch chat history for session {session_id}: {e}")
+            logger.error(f"Failed to fetch chat history for user {telegram_user_id}: {e}")
     else:
-        logger.warning(f"generate_llm_response: session_id is None, skipping history fetch.")
+        logger.warning(f"generate_llm_response: telegram_user_id is None, skipping history fetch.")
         
     try:
         # ---- OpenAI Handler ----
@@ -286,14 +287,14 @@ async def start_bot(config: dict):
             except Exception as e:
                 logger.error(f"Failed to fetch sender profile: {e}")
 
-            # Get or create the mapped Supabase session ID
+            # Get or create the mapped Supabase session ID (legacy)
             session_id = None
             try:
                 session_id = await get_or_create_telegram_session(bot_id, user_id, user_name)
             except Exception as e:
                 logger.error(f"Failed to resolve session ID for Telegram chat: {e}")
 
-            # Save the user's message to Supabase
+            # 1. Save the user's message to legacy chatbot_messages
             if session_id:
                 try:
                     user_msg_query = supabase.table('chatbot_messages').insert({
@@ -303,14 +304,27 @@ async def start_bot(config: dict):
                     })
                     await run_supabase_query(user_msg_query)
                 except Exception as e:
-                    logger.error(f"Failed to save user message to Supabase: {e}")
+                    logger.error(f"Failed to save user message to legacy chatbot_messages: {e}")
+            
+            # 2. Save the user's message to dedicated telegram_chat_messages
+            try:
+                tg_user_msg_query = supabase.table('telegram_chat_messages').insert({
+                    'bot_id': bot_id,
+                    'telegram_user_id': user_id,
+                    'user_name': user_name,
+                    'role': 'user',
+                    'content': user_message
+                })
+                await run_supabase_query(tg_user_msg_query)
+            except Exception as e:
+                logger.error(f"Failed to save user message to telegram_chat_messages: {e}")
             
             # Show "typing..." status and get response
             async with client.action(event.chat_id, 'typing'):
-                response = await generate_llm_response(bot_id, user_message, session_id)
+                response = await generate_llm_response(bot_id, user_message, user_id)
                 await event.respond(response)
                 
-                # Save the bot's response to Supabase
+                # 3. Save the bot's response to legacy chatbot_messages
                 if session_id:
                     try:
                         bot_msg_query = supabase.table('chatbot_messages').insert({
@@ -320,7 +334,20 @@ async def start_bot(config: dict):
                         })
                         await run_supabase_query(bot_msg_query)
                     except Exception as e:
-                        logger.error(f"Failed to save bot response to Supabase: {e}")
+                        logger.error(f"Failed to save bot response to legacy chatbot_messages: {e}")
+
+                # 4. Save the bot's response to dedicated telegram_chat_messages
+                try:
+                    tg_bot_msg_query = supabase.table('telegram_chat_messages').insert({
+                        'bot_id': bot_id,
+                        'telegram_user_id': user_id,
+                        'user_name': user_name,
+                        'role': 'assistant',
+                        'content': response
+                    })
+                    await run_supabase_query(tg_bot_msg_query)
+                except Exception as e:
+                    logger.error(f"Failed to save bot response to telegram_chat_messages: {e}")
 
         active_clients[bot_id] = client
         await client.run_until_disconnected()
