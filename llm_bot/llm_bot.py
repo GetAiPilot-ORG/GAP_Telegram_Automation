@@ -51,8 +51,8 @@ async def run_supabase_query(query):
 if not os.path.exists("sessions"):
     os.makedirs("sessions")
 
-async def generate_llm_response(bot_id: str, user_message: str) -> str:
-    """Generate a response using the configured LLM API key."""
+async def generate_llm_response(bot_id: str, user_message: str, session_id: str = None) -> str:
+    """Generate a response using the configured LLM API key and optional conversation history."""
     config = GLOBAL_BOT_CONFIGS.get(bot_id)
     if not config:
         return "Sorry, my configuration is currently unavailable."
@@ -85,17 +85,43 @@ async def generate_llm_response(bot_id: str, user_message: str) -> str:
     
     if not api_key:
         return "⚠️ Setup Error: The API key for this bot has not been configured."
+
+    # Fetch conversation history from Supabase
+    history = []
+    if session_id:
+        try:
+            history_query = supabase.table('chatbot_messages')\
+                .select('role, content')\
+                .eq('session_id', session_id)\
+                .order('created_at', desc=True)\
+                .limit(20)
+            res = await run_supabase_query(history_query)
+            if res.data:
+                history = list(reversed(res.data))
+        except Exception as e:
+            logger.error(f"Failed to fetch chat history for session {session_id}: {e}")
         
     try:
         # ---- OpenAI Handler ----
         if "openai" in provider:
             client = openai.AsyncOpenAI(api_key=api_key)
+            
+            messages = [{"role": "system", "content": system_prompt}]
+            
+            # Format and append history
+            has_current_message = False
+            for msg in history:
+                messages.append({"role": msg.get("role"), "content": msg.get("content")})
+                if msg.get("role") == "user" and msg.get("content") == user_message:
+                    has_current_message = True
+            
+            # If the current message wasn't in history, append it
+            if not has_current_message:
+                messages.append({"role": "user", "content": user_message})
+
             response = await client.chat.completions.create(
                 model="gpt-3.5-turbo", # Default fast model
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message}
-                ],
+                messages=messages,
                 max_tokens=600
             )
             return response.choices[0].message.content
@@ -114,10 +140,23 @@ async def generate_llm_response(bot_id: str, user_message: str) -> str:
                 HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
                 HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
             }
+            
+            gemini_contents = []
+            has_current_message = False
+            for msg in history:
+                role = "model" if msg.get("role") == "assistant" else "user"
+                gemini_contents.append({"role": role, "parts": [msg.get("content")]})
+                if msg.get("role") == "user" and msg.get("content") == user_message:
+                    has_current_message = True
+            
+            # If current message wasn't in history, append it
+            if not has_current_message:
+                gemini_contents.append({"role": "user", "parts": [user_message]})
+
             # Since genai usually runs synchronously, run in executor
             def _generate():
                 try:
-                    res = model.generate_content(user_message, safety_settings=safety_settings)
+                    res = model.generate_content(gemini_contents, safety_settings=safety_settings)
                     return res.text
                 except Exception as ex:
                     logger.error(f"Gemini error: {ex}")
@@ -251,7 +290,7 @@ async def start_bot(config: dict):
             
             # Show "typing..." status and get response
             async with client.action(event.chat_id, 'typing'):
-                response = await generate_llm_response(bot_id, user_message)
+                response = await generate_llm_response(bot_id, user_message, session_id)
                 await event.respond(response)
                 
                 # Save the bot's response to Supabase
