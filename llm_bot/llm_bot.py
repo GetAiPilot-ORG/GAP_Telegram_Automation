@@ -86,6 +86,8 @@ async def generate_llm_response(bot_id: str, user_message: str, session_id: str 
     if not api_key:
         return "⚠️ Setup Error: The API key for this bot has not been configured."
 
+    logger.info(f"generate_llm_response called: bot_id={bot_id}, session_id={session_id}, user_message={user_message[:50]}")
+
     # Fetch conversation history from Supabase
     history = []
     if session_id:
@@ -98,8 +100,15 @@ async def generate_llm_response(bot_id: str, user_message: str, session_id: str 
             res = await run_supabase_query(history_query)
             if res.data:
                 history = list(reversed(res.data))
+                logger.info(f"Fetched {len(history)} messages from history for session {session_id}.")
+                for idx, msg in enumerate(history):
+                    logger.info(f"  History msg [{idx}] - {msg.get('role')}: {msg.get('content')[:60]}...")
+            else:
+                logger.warning(f"No history messages found for session {session_id} in chatbot_messages.")
         except Exception as e:
             logger.error(f"Failed to fetch chat history for session {session_id}: {e}")
+    else:
+        logger.warning(f"generate_llm_response: session_id is None, skipping history fetch.")
         
     try:
         # ---- OpenAI Handler ----
@@ -118,6 +127,10 @@ async def generate_llm_response(bot_id: str, user_message: str, session_id: str 
             # If the current message wasn't in history, append it
             if not has_current_message:
                 messages.append({"role": "user", "content": user_message})
+
+            logger.info(f"Sending {len(messages)} messages to OpenAI for bot {bot_id}:")
+            for idx, msg in enumerate(messages):
+                logger.info(f"  OpenAI msg [{idx}] role={msg.get('role')}: {msg.get('content')[:100]}...")
 
             response = await client.chat.completions.create(
                 model="gpt-3.5-turbo", # Default fast model
@@ -152,6 +165,10 @@ async def generate_llm_response(bot_id: str, user_message: str, session_id: str 
             # If current message wasn't in history, append it
             if not has_current_message:
                 gemini_contents.append({"role": "user", "parts": [user_message]})
+
+            logger.info(f"Sending {len(gemini_contents)} turns to Gemini for bot {bot_id}:")
+            for idx, turn in enumerate(gemini_contents):
+                logger.info(f"  Gemini turn [{idx}] role={turn.get('role')}: {turn.get('parts')[0][:100]}...")
 
             # Since genai usually runs synchronously, run in executor
             def _generate():
