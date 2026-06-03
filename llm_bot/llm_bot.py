@@ -351,8 +351,9 @@ async def start_bot(config: dict):
 
 
         @client.on(events.Raw)
-        async def raw_handler(update):
-            if not isinstance(update, types.UpdateBotNewBusinessMessage):
+        async def raw_handler(event):
+            update = getattr(event, 'original_update', None)
+            if not update or not isinstance(update, types.UpdateBotNewBusinessMessage):
                 return
 
             msg = update.message
