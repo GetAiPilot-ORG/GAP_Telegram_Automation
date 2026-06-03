@@ -4,7 +4,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, functions, types
 import openai
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
@@ -348,6 +348,131 @@ async def start_bot(config: dict):
                     await run_supabase_query(tg_bot_msg_query)
                 except Exception as e:
                     logger.error(f"Failed to save bot response to telegram_chat_messages: {e}")
+
+
+        @client.on(events.Raw)
+        async def raw_handler(update):
+            if not isinstance(update, types.UpdateBotNewBusinessMessage):
+                return
+
+            msg = update.message
+            if not msg or getattr(msg, 'out', False) or not getattr(msg, 'message', ''):
+                return
+
+            connection_id = update.connection_id
+            user_message = msg.message
+
+            # Extract user_id/sender_id
+            user_id = getattr(msg, 'sender_id', None)
+            if not user_id:
+                if hasattr(msg, 'from_id') and hasattr(msg.from_id, 'user_id'):
+                    user_id = msg.from_id.user_id
+                else:
+                    user_id = getattr(msg, 'chat_id', None)
+
+            if not user_id:
+                logger.error("Could not determine sender/user_id for business message")
+                return
+
+            logger.info(f"LLM Bot {bot_id} (Business): Received message from {user_id}: {user_message[:50]}...")
+
+            # Fetch sender details to construct user name
+            user_name = f"User {user_id}"
+            try:
+                sender = await client.get_entity(user_id)
+                if sender:
+                    first_name = getattr(sender, 'first_name', '') or ''
+                    last_name = getattr(sender, 'last_name', '') or ''
+                    username = getattr(sender, 'username', '') or ''
+                    
+                    full_name = f"{first_name} {last_name}".strip()
+                    if full_name:
+                        user_name = full_name
+                    elif username:
+                        user_name = username
+            except Exception as e:
+                logger.error(f"Failed to fetch sender profile: {e}")
+
+            # Get or create the mapped Supabase session ID (legacy)
+            session_id = None
+            try:
+                session_id = await get_or_create_telegram_session(bot_id, user_id, user_name)
+            except Exception as e:
+                logger.error(f"Failed to resolve session ID for Telegram chat: {e}")
+
+            # 1. Save the user's message to legacy chatbot_messages
+            if session_id:
+                try:
+                    user_msg_query = supabase.table('chatbot_messages').insert({
+                        'session_id': session_id,
+                        'role': 'user',
+                        'content': user_message
+                    })
+                    await run_supabase_query(user_msg_query)
+                except Exception as e:
+                    logger.error(f"Failed to save user message to legacy chatbot_messages: {e}")
+            
+            # 2. Save the user's message to dedicated telegram_chat_messages
+            try:
+                tg_user_msg_query = supabase.table('telegram_chat_messages').insert({
+                    'bot_id': bot_id,
+                    'telegram_user_id': user_id,
+                    'user_name': user_name,
+                    'role': 'user',
+                    'content': user_message
+                })
+                await run_supabase_query(tg_user_msg_query)
+            except Exception as e:
+                logger.error(f"Failed to save user message to telegram_chat_messages: {e}")
+            
+            # Generate response
+            response = await generate_llm_response(bot_id, user_message, user_id)
+            
+            # Send message via business connection
+            try:
+                try:
+                    peer = await client.get_input_entity(msg.peer_id)
+                except Exception:
+                    peer = msg.peer_id
+
+                send_msg_req = functions.messages.SendMessageRequest(
+                    peer=peer,
+                    message=response,
+                    reply_to=types.InputMessageReplyToMessage(reply_to_msg_id=msg.id)
+                )
+                
+                await client(functions.InvokeWithBusinessConnectionRequest(
+                    connection_id=connection_id,
+                    query=send_msg_req
+                ))
+            except Exception as e:
+                logger.error(f"Failed to send response via business connection: {e}")
+                return
+
+            # 3. Save the bot's response to legacy chatbot_messages
+            if session_id:
+                try:
+                    bot_msg_query = supabase.table('chatbot_messages').insert({
+                        'session_id': session_id,
+                        'role': 'assistant',
+                        'content': response
+                    })
+                    await run_supabase_query(bot_msg_query)
+                except Exception as e:
+                    logger.error(f"Failed to save bot response to legacy chatbot_messages: {e}")
+
+            # 4. Save the bot's response to dedicated telegram_chat_messages
+            try:
+                tg_bot_msg_query = supabase.table('telegram_chat_messages').insert({
+                    'bot_id': bot_id,
+                    'telegram_user_id': user_id,
+                    'user_name': user_name,
+                    'role': 'assistant',
+                    'content': response
+                })
+                await run_supabase_query(tg_bot_msg_query)
+            except Exception as e:
+                logger.error(f"Failed to save bot response to telegram_chat_messages: {e}")
 
         active_clients[bot_id] = client
         await client.run_until_disconnected()
