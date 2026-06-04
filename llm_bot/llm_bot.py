@@ -480,9 +480,7 @@ async def start_bot(config: dict):
                             logger.info("Skipping business update because message is missing")
                             continue
 
-                        if getattr(msg, "out", False):
-                            logger.info("Skipping outgoing business message to avoid self-reply loop")
-                            continue
+                        logger.info(f"BUSINESS MSG DEBUG -> out={getattr(msg, 'out', None)}, text={getattr(msg, 'message', None)}")
 
                         text = getattr(msg, "message", None)
                         if not text:
