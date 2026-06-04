@@ -574,20 +574,34 @@ async def start_bot(config: dict):
                         
                         # Send reply using Telegram business connection (Requirement 6)
                         try:
-                            send_msg_req = functions.messages.SendMessageRequest(
+                            import asyncio
+                            from telethon import functions
+                            import random
+
+                            send_req = functions.messages.SendMessageRequest(
                                 peer=peer,
                                 message=response,
                                 random_id=random.randint(-(2**63), 2**63 - 1)
                             )
-                            
-                            logger.info("BEFORE BUSINESS SEND")
-                            result = await client(functions.InvokeWithBusinessConnectionRequest(
-                                connection_id=connection_id,
-                                query=send_msg_req
-                            ))
+
+                            logger.info(f"BEFORE BUSINESS SEND connection_id={connection_id}, peer={peer}, response={response[:100]}")
+
+                            result = await asyncio.wait_for(
+                                client(functions.InvokeWithBusinessConnectionRequest(
+                                    connection_id=connection_id,
+                                    query=send_req
+                                )),
+                                timeout=15
+                            )
+
                             logger.info(f"BUSINESS SEND RESULT: {result}")
-                        except Exception as send_err:
-                            logger.exception("Business send failed")
+
+                        except asyncio.TimeoutError:
+                            logger.exception("Business send timed out after 15 seconds")
+                            continue
+
+                        except Exception:
+                            logger.exception("Business send failed with exception")
                             continue
 
                         # 3. Save the bot's response to legacy chatbot_messages
