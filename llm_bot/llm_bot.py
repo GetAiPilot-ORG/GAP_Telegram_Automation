@@ -480,7 +480,12 @@ async def start_bot(config: dict):
                             logger.info("Skipping business update because message is missing")
                             continue
 
-                        logger.info(f"BUSINESS MSG DEBUG -> out={getattr(msg, 'out', None)}, text={getattr(msg, 'message', None)}")
+                        logger.info(
+                            f"BUSINESS MSG DEBUG -> out={getattr(msg, 'out', None)}, "
+                            f"text={getattr(msg, 'message', None)}, "
+                            f"peer={getattr(msg, 'peer_id', None)}, "
+                            f"from_id={getattr(msg, 'from_id', None)}"
+                        )
 
                         text = getattr(msg, "message", None)
                         if not text:
@@ -569,12 +574,10 @@ async def start_bot(config: dict):
                         
                         # Send reply using Telegram business connection (Requirement 6)
                         try:
-                            logger.info("Using types.InputReplyToMessage for replying to business message")
                             send_msg_req = functions.messages.SendMessageRequest(
                                 peer=peer,
                                 message=response,
-                                random_id=random.randint(-(2**63), 2**63 - 1),
-                                reply_to=types.InputReplyToMessage(reply_to_msg_id=msg.id)
+                                random_id=random.randint(-(2**63), 2**63 - 1)
                             )
                             
                             logger.info("BEFORE BUSINESS SEND")
