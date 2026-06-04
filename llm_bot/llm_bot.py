@@ -387,7 +387,7 @@ async def start_bot(config: dict):
             logger.info(f"LLM Bot {bot_id} (Raw Event): Received incoming update type {type(update).__name__}")
 
             # Support business_connection update (Requirement 2)
-            if isinstance(update, types.UpdateBotBusinessConnection):
+            if isinstance(update, types.UpdateBotBusinessConnect):
                 connection = update.connection
                 logger.info(
                     f"LLM Bot {bot_id} (business_connection): "
@@ -407,7 +407,7 @@ async def start_bot(config: dict):
                 return
 
             # Support deleted_business_messages update (Requirement 2)
-            if isinstance(update, types.UpdateBotDeleteBusinessMessages):
+            if isinstance(update, types.UpdateBotDeleteBusinessMessage):
                 logger.info(
                     f"LLM Bot {bot_id} (deleted_business_messages): "
                     f"Messages: {update.messages} deleted in connection: {update.connection_id}"
