@@ -477,10 +477,18 @@ async def start_bot(config: dict):
                         connection_id = u.connection_id
                         msg = u.message
                         if not msg:
+                            logger.info("Skipping business update because message is missing")
                             continue
-                        text = msg.message
+
+                        if getattr(msg, "out", False):
+                            logger.info("Skipping outgoing business message to avoid self-reply loop")
+                            continue
+
+                        text = getattr(msg, "message", None)
                         if not text:
+                            logger.info("Skipping business message without text")
                             continue
+
                         peer = msg.peer_id
 
                         logger.info(f"BUSINESS MESSAGE RECEIVED connection_id={connection_id}, peer={msg.peer_id}, text={text}")
