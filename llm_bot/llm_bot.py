@@ -230,6 +230,7 @@ async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id
 async def get_or_create_telegram_session(bot_id: str, telegram_user_id: int, user_name: str) -> str:
     """Find or create a chatbot session for a Telegram user chatting with a specific bot."""
     try:
+        logger.info(f"get_or_create_telegram_session called for bot_id={bot_id}, telegram_user_id={telegram_user_id}, user_name={user_name}")
         # 1. Try to find existing session mapping
         query_select = supabase.table('telegram_bot_sessions')\
             .select('id')\
@@ -238,20 +239,24 @@ async def get_or_create_telegram_session(bot_id: str, telegram_user_id: int, use
         
         res = await run_supabase_query(query_select)
         if res.data and len(res.data) > 0:
-            return res.data[0]['id']
+            session_id = res.data[0]['id']
+            logger.info(f"Found existing telegram bot session: {session_id}")
+            return session_id
             
         # 2. If not found, create new session in chatbot_sessions
+        logger.info("No existing session found. Creating a new session in chatbot_sessions...")
         query_insert_session = supabase.table('chatbot_sessions')\
-            .insert({'status': 'active'})\
-            .select('id')
+            .insert({'status': 'active'})
             
         session_res = await run_supabase_query(query_insert_session)
         if not session_res.data or len(session_res.data) == 0:
             raise ValueError("Failed to create chatbot session")
             
         session_id = session_res.data[0]['id']
+        logger.info(f"Successfully created new chatbot session: {session_id}")
         
         # 3. Create mapping in telegram_bot_sessions
+        logger.info(f"Creating session mapping in telegram_bot_sessions with id={session_id}...")
         query_insert_mapping = supabase.table('telegram_bot_sessions')\
             .insert({
                 'id': session_id,
@@ -261,10 +266,11 @@ async def get_or_create_telegram_session(bot_id: str, telegram_user_id: int, use
             })
             
         await run_supabase_query(query_insert_mapping)
+        logger.info(f"Successfully mapped session: {session_id} to bot: {bot_id} for user: {telegram_user_id}")
         return session_id
         
     except Exception as e:
-        logger.error(f"Error in get_or_create_telegram_session: {e}")
+        logger.error(f"Error in get_or_create_telegram_session: {e}", exc_info=True)
         raise
 
 async def start_bot(config: dict):
