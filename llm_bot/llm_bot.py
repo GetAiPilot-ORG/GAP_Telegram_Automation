@@ -8,6 +8,9 @@ from telethon import TelegramClient, events, functions, types
 import openai
 import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
+import urllib.request
+import urllib.parse
+import json
 
 # ---- 1. Logging Setup ----
 logging.basicConfig(
@@ -36,6 +39,26 @@ GLOBAL_BOT_CONFIGS = {}
 
 # Global set of bot IDs that are currently active join bots (have channel mappings)
 GLOBAL_JOIN_BOT_IDS = set()
+
+def configure_bot_allowed_updates(token: str):
+    """Ensure Bot API webhook is deleted and allowed_updates is set for MTProto (Requirement 4)"""
+    try:
+        allowed_updates = ["message", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"]
+        url = f"https://api.telegram.org/bot{token}/deleteWebhook"
+        data = urllib.parse.urlencode({
+            "drop_pending_updates": "true",
+            "allowed_updates": json.dumps(allowed_updates)
+        }).encode("utf-8")
+        
+        req = urllib.request.Request(url, data=data)
+        with urllib.request.urlopen(req) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+            if res_data.get("ok"):
+                logger.info(f"Successfully configured allowed_updates for bot token {token[:10]}...")
+            else:
+                logger.warning(f"Failed to configure allowed_updates: {res_data.get('description')}")
+    except Exception as e:
+        logger.error(f"Error configuring bot allowed_updates: {e}")
 
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "12345678"))
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "dummyhash")
@@ -241,6 +264,9 @@ async def start_bot(config: dict):
     token = config['bot_token']
     logger.info(f"Starting LLM bot: {bot_id}")
     
+    # Configure allowed updates for bot (Requirement 4)
+    configure_bot_allowed_updates(token)
+    
     try:
         # Load from the same sessions directory as bot.py
         client = TelegramClient(f"sessions/llm_bot_{bot_id}", API_ID, API_HASH)
@@ -352,15 +378,64 @@ async def start_bot(config: dict):
 
         @client.on(events.Raw)
         async def raw_handler(event):
-            update = getattr(event, 'original_update', None)
-            if not update or not isinstance(update, types.UpdateBotNewBusinessMessage):
+            # In Telethon events.Raw, the handler is called with the raw update object directly (Requirement 7)
+            update = event
+            if not update:
+                return
+
+            # Log all incoming raw updates for tracking (Requirement 5)
+            logger.info(f"LLM Bot {bot_id} (Raw Event): Received incoming update type {type(update).__name__}")
+
+            # Support business_connection update (Requirement 2)
+            if isinstance(update, types.UpdateBotBusinessConnection):
+                connection = update.connection
+                logger.info(
+                    f"LLM Bot {bot_id} (business_connection): "
+                    f"Connection ID: {connection.connection_id}, "
+                    f"User ID: {connection.user_id}, "
+                    f"Disabled: {connection.disabled}"
+                )
+                return
+
+            # Support edited_business_message update (Requirement 2)
+            if isinstance(update, types.UpdateBotEditBusinessMessage):
+                msg = update.message
+                logger.info(
+                    f"LLM Bot {bot_id} (edited_business_message): "
+                    f"Message ID: {msg.id} edited in connection: {update.connection_id}"
+                )
+                return
+
+            # Support deleted_business_messages update (Requirement 2)
+            if isinstance(update, types.UpdateBotDeleteBusinessMessages):
+                logger.info(
+                    f"LLM Bot {bot_id} (deleted_business_messages): "
+                    f"Messages: {update.messages} deleted in connection: {update.connection_id}"
+                )
+                return
+
+            # Support business_message update (Requirement 2)
+            if not isinstance(update, types.UpdateBotNewBusinessMessage):
                 return
 
             msg = update.message
             if not msg or getattr(msg, 'out', False) or not getattr(msg, 'message', ''):
                 return
 
+            # Extract fields (Requirement 3)
             connection_id = update.connection_id
+            
+            # Extract chat_id
+            peer = msg.peer_id
+            if hasattr(peer, 'user_id'):
+                chat_id = peer.user_id
+            elif hasattr(peer, 'channel_id'):
+                chat_id = peer.channel_id
+            elif hasattr(peer, 'chat_id'):
+                chat_id = peer.chat_id
+            else:
+                chat_id = getattr(msg, 'chat_id', None)
+                
             user_message = msg.message
 
             # Extract user_id/sender_id
@@ -369,13 +444,16 @@ async def start_bot(config: dict):
                 if hasattr(msg, 'from_id') and hasattr(msg.from_id, 'user_id'):
                     user_id = msg.from_id.user_id
                 else:
-                    user_id = getattr(msg, 'chat_id', None)
+                    user_id = chat_id or getattr(msg, 'chat_id', None)
 
             if not user_id:
                 logger.error("Could not determine sender/user_id for business message")
                 return
 
-            logger.info(f"LLM Bot {bot_id} (Business): Received message from {user_id}: {user_message[:50]}...")
+            logger.info(
+                f"LLM Bot {bot_id} (business_message): Received message. "
+                f"business_connection_id={connection_id}, chat_id={chat_id}, text={user_message[:50]}..."
+            )
 
             # Fetch sender details to construct user name
             user_name = f"User {user_id}"
