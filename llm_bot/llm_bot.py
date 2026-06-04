@@ -272,13 +272,12 @@ async def start_bot(config: dict):
     logger.info(f"Preparing to start bot config: bot_id={bot_id}, token_prefix={token[:10]}")
     logger.info(f"Starting LLM bot: {bot_id}")
     
+    client = None
     try:
         logger.info(f"ENTERING start_bot bot_id={bot_id}")
 
         # Configure allowed updates for bot (Requirement 4)
-        logger.info(f"BEFORE configure_bot_allowed_updates for bot_id={bot_id}")
-        configure_bot_allowed_updates(token)
-        logger.info(f"AFTER configure_bot_allowed_updates for bot_id={bot_id}")
+        logger.info("Skipping deleteWebhook for Telethon MTProto startup")
         
         # Load from the same sessions directory as bot.py
         client = TelegramClient(f"sessions/llm_bot_{bot_id}", API_ID, API_HASH)
@@ -287,21 +286,14 @@ async def start_bot(config: dict):
         import telethon
         logger.info(f"TELETHON VERSION: {telethon.__version__}")
         
-        await asyncio.wait_for(
-            client.start(bot_token=token),
-            timeout=30
-        )
+        await client.start(bot_token=token)
         logger.info("client.start completed")
         
         logger.info(f"BEFORE client.get_me for bot_id={bot_id}")
         me = await client.get_me()
         logger.info(f"AFTER client.get_me for bot_id={bot_id}")
         
-        logger.info(
-            f"BOT VERIFIED username=@{me.username} "
-            f"id={me.id} "
-            f"bot_id={bot_id}"
-        )
+        logger.info(f"BOT VERIFIED username=@{me.username}, id={me.id}, bot_id={bot_id}")
         
         @client.on(events.NewMessage)
         async def handler(event):
@@ -324,7 +316,7 @@ async def start_bot(config: dict):
 
             user_id = event.sender_id
             
-            logger.info(f"LLM Bot {bot_id}: Received message from {user_id}: {user_message[:50]}...")
+            logger.info(f"NORMAL MESSAGE RECEIVED bot_id={bot_id}, chat_id={event.chat_id}, sender_id={event.sender_id}, text={user_message}")
             
             # Fetch sender details to construct user name
             user_name = f"User {user_id}"
@@ -408,218 +400,238 @@ async def start_bot(config: dict):
 
         @client.on(events.Raw)
         async def raw_handler(event):
-            logger.info("=" * 80)
-            logger.info(f"RAW EVENT TYPE: {type(event).__name__}")
-
             try:
-                logger.info(event.stringify())
-            except Exception as e:
-                logger.error(f"Stringify failed: {e}")
+                logger.info("=" * 80)
+                logger.info(f"RAW EVENT TYPE: {type(event).__name__}")
 
-            if hasattr(event, "updates"):
-                logger.info(f"Updates container count: {len(event.updates)}")
-                for idx, upd in enumerate(event.updates):
-                    logger.info(f"NESTED UPDATE [{idx}] TYPE: {type(upd).__name__}")
-                    try:
-                        logger.info(upd.stringify())
-                    except:
-                        pass
+                try:
+                    logger.info(event.stringify())
+                except Exception as e:
+                    logger.error(f"Stringify failed: {e}")
 
-            # Inspect Updates containers if matching
-            update = event
-            if not update:
-                return
+                if hasattr(event, "updates"):
+                    logger.info(f"Updates container count: {len(event.updates)}")
+                    for idx, upd in enumerate(event.updates):
+                        logger.info(f"NESTED UPDATE [{idx}] TYPE: {type(upd).__name__}")
+                        try:
+                            logger.info(upd.stringify())
+                        except:
+                            pass
 
-            updates_to_process = []
-            if isinstance(update, (types.Updates, types.UpdatesCombined)):
-                for inner_update in update.updates:
-                    updates_to_process.append(inner_update)
-            else:
-                updates_to_process.append(update)
+                # Inspect Updates containers if matching
+                update = event
+                if not update:
+                    return
 
-            for u in updates_to_process:
-                logger.info(f"UPDATE CLASS = {u.__class__.__name__}")
-
-                # Support business_connection update (Requirement 2)
-                if isinstance(u, types.UpdateBotBusinessConnect):
-                    connection = u.connection
-                    logger.info(
-                        f"LLM Bot {bot_id} (business_connection): "
-                        f"Connection ID: {connection.connection_id}, "
-                        f"User ID: {connection.user_id}, "
-                        f"Disabled: {connection.disabled}"
-                    )
-                    continue
-
-                # Support edited_business_message update (Requirement 2)
-                if isinstance(u, types.UpdateBotEditBusinessMessage):
-                    msg = u.message
-                    logger.info(
-                        f"LLM Bot {bot_id} (edited_business_message): "
-                        f"Message ID: {msg.id} edited in connection: {u.connection_id}"
-                    )
-                    continue
-
-                # Support deleted_business_messages update (Requirement 2)
-                if isinstance(u, types.UpdateBotDeleteBusinessMessage):
-                    logger.info(
-                        f"LLM Bot {bot_id} (deleted_business_messages): "
-                        f"Messages: {u.messages} deleted in connection: {u.connection_id}"
-                    )
-                    continue
-
-                # Support business_message update (Requirement 2)
-                if not isinstance(u, types.UpdateBotNewBusinessMessage):
-                    logger.info(f"UNHANDLED RAW UPDATE CLASS: {u.__class__.__name__}")
-                    continue
-
-                msg = u.message
-                if not msg:
-                    continue
-
-                logger.info(
-                    f"BUSINESS MSG DEBUG -> out={getattr(msg,'out',None)} "
-                    f"text={getattr(msg,'message',None)}"
-                )
-
-                # Extract fields (Requirement 3)
-                connection_id = u.connection_id
-                
-                # Extract chat_id
-                peer = msg.peer_id
-                if hasattr(peer, 'user_id'):
-                    chat_id = peer.user_id
-                elif hasattr(peer, 'channel_id'):
-                    chat_id = peer.channel_id
-                elif hasattr(peer, 'chat_id'):
-                    chat_id = peer.chat_id
+                updates_to_process = []
+                if isinstance(update, (types.Updates, types.UpdatesCombined)):
+                    for inner_update in update.updates:
+                        updates_to_process.append(inner_update)
                 else:
-                    chat_id = getattr(msg, 'chat_id', None)
+                    updates_to_process.append(update)
+
+                for u in updates_to_process:
+                    logger.info(f"UPDATE CLASS = {u.__class__.__name__}")
+
+                    # Support business_connection update (Requirement 2)
+                    if isinstance(u, types.UpdateBotBusinessConnect):
+                        connection = u.connection
+                        logger.info(
+                            f"LLM Bot {bot_id} (business_connection): "
+                            f"Connection ID: {connection.connection_id}, "
+                            f"User ID: {connection.user_id}, "
+                            f"Disabled: {connection.disabled}"
+                        )
+                        continue
+
+                    # Support edited_business_message update (Requirement 2)
+                    if isinstance(u, types.UpdateBotEditBusinessMessage):
+                        msg = u.message
+                        logger.info(
+                            f"LLM Bot {bot_id} (edited_business_message): "
+                            f"Message ID: {msg.id} edited in connection: {u.connection_id}"
+                        )
+                        continue
+
+                    # Support deleted_business_messages update (Requirement 2)
+                    if isinstance(u, types.UpdateBotDeleteBusinessMessage):
+                        logger.info(
+                            f"LLM Bot {bot_id} (deleted_business_messages): "
+                            f"Messages: {u.messages} deleted in connection: {u.connection_id}"
+                        )
+                        continue
+
+                    # Support business_message update (Requirement 2)
+                    if not isinstance(u, types.UpdateBotNewBusinessMessage):
+                        logger.info(f"UNHANDLED RAW UPDATE CLASS: {u.__class__.__name__}")
+                        continue
+
+                    msg = u.message
+                    if not msg:
+                        continue
+
+                    logger.info(
+                        f"BUSINESS MSG DEBUG -> out={getattr(msg,'out',None)} "
+                        f"text={getattr(msg,'message',None)}"
+                    )
+
+                    # Extract fields (Requirement 3)
+                    connection_id = u.connection_id
                     
-                user_message = msg.message
-
-                # Extract user_id/sender_id
-                user_id = getattr(msg, 'sender_id', None)
-                if not user_id:
-                    if hasattr(msg, 'from_id') and hasattr(msg.from_id, 'user_id'):
-                        user_id = msg.from_id.user_id
+                    # Extract chat_id
+                    peer = msg.peer_id
+                    if hasattr(peer, 'user_id'):
+                        chat_id = peer.user_id
+                    elif hasattr(peer, 'channel_id'):
+                        chat_id = peer.channel_id
+                    elif hasattr(peer, 'chat_id'):
+                        chat_id = peer.chat_id
                     else:
-                        user_id = chat_id or getattr(msg, 'chat_id', None)
-
-                if not user_id:
-                    logger.error("Could not determine sender/user_id for business message")
-                    continue
-
-                logger.info(
-                    f"LLM Bot {bot_id} (business_message): Received message. "
-                    f"business_connection_id={connection_id}, chat_id={chat_id}, text={user_message[:50]}..."
-                )
-
-                # Fetch sender details to construct user name
-                user_name = f"User {user_id}"
-                try:
-                    sender = await client.get_entity(user_id)
-                    if sender:
-                        first_name = getattr(sender, 'first_name', '') or ''
-                        last_name = getattr(sender, 'last_name', '') or ''
-                        username = getattr(sender, 'username', '') or ''
+                        chat_id = getattr(msg, 'chat_id', None)
                         
-                        full_name = f"{first_name} {last_name}".strip()
-                        if full_name:
-                            user_name = full_name
-                        elif username:
-                            user_name = username
-                except Exception as e:
-                    logger.error(f"Failed to fetch sender profile: {e}")
+                    user_message = msg.message
 
-                # Get or create the mapped Supabase session ID (legacy)
-                session_id = None
-                try:
-                    session_id = await get_or_create_telegram_session(bot_id, user_id, user_name)
-                except Exception as e:
-                    logger.error(f"Failed to resolve session ID for Telegram chat: {e}")
+                    # Extract user_id/sender_id
+                    user_id = getattr(msg, 'sender_id', None)
+                    if not user_id:
+                        if hasattr(msg, 'from_id') and hasattr(msg.from_id, 'user_id'):
+                            user_id = msg.from_id.user_id
+                        else:
+                            user_id = chat_id or getattr(msg, 'chat_id', None)
 
-                # 1. Save the user's message to legacy chatbot_messages
-                if session_id:
+                    if not user_id:
+                        logger.error("Could not determine sender/user_id for business message")
+                        continue
+
+                    logger.info(
+                        f"LLM Bot {bot_id} (business_message): Received message. "
+                        f"business_connection_id={connection_id}, chat_id={chat_id}, text={user_message[:50]}..."
+                    )
+
+                    # Fetch sender details to construct user name
+                    user_name = f"User {user_id}"
                     try:
-                        user_msg_query = supabase.table('chatbot_messages').insert({
-                            'session_id': session_id,
+                        sender = await client.get_entity(user_id)
+                        if sender:
+                            first_name = getattr(sender, 'first_name', '') or ''
+                            last_name = getattr(sender, 'last_name', '') or ''
+                            username = getattr(sender, 'username', '') or ''
+                            
+                            full_name = f"{first_name} {last_name}".strip()
+                            if full_name:
+                                user_name = full_name
+                            elif username:
+                                user_name = username
+                    except Exception as e:
+                        logger.error(f"Failed to fetch sender profile: {e}")
+
+                    # Get or create the mapped Supabase session ID (legacy)
+                    session_id = None
+                    try:
+                        session_id = await get_or_create_telegram_session(bot_id, user_id, user_name)
+                    except Exception as e:
+                        logger.error(f"Failed to resolve session ID for Telegram chat: {e}")
+
+                    # 1. Save the user's message to legacy chatbot_messages
+                    if session_id:
+                        try:
+                            user_msg_query = supabase.table('chatbot_messages').insert({
+                                'session_id': session_id,
+                                'role': 'user',
+                                'content': user_message
+                            })
+                            await run_supabase_query(user_msg_query)
+                        except Exception as e:
+                            logger.error(f"Failed to save user message to legacy chatbot_messages: {e}")
+                    
+                    # 2. Save the user's message to dedicated telegram_chat_messages
+                    try:
+                        tg_user_msg_query = supabase.table('telegram_chat_messages').insert({
+                            'bot_id': bot_id,
+                            'telegram_user_id': user_id,
+                            'user_name': user_name,
                             'role': 'user',
                             'content': user_message
                         })
-                        await run_supabase_query(user_msg_query)
+                        await run_supabase_query(tg_user_msg_query)
                     except Exception as e:
-                        logger.error(f"Failed to save user message to legacy chatbot_messages: {e}")
-                
-                # 2. Save the user's message to dedicated telegram_chat_messages
-                try:
-                    tg_user_msg_query = supabase.table('telegram_chat_messages').insert({
-                        'bot_id': bot_id,
-                        'telegram_user_id': user_id,
-                        'user_name': user_name,
-                        'role': 'user',
-                        'content': user_message
-                    })
-                    await run_supabase_query(tg_user_msg_query)
-                except Exception as e:
-                    logger.error(f"Failed to save user message to telegram_chat_messages: {e}")
-                
-                # Generate response
-                response = await generate_llm_response(bot_id, user_message, user_id)
-                
-                # Send message via business connection
-                try:
-                    try:
-                        peer = await client.get_input_entity(msg.peer_id)
-                    except Exception:
-                        peer = msg.peer_id
-
-                    send_msg_req = functions.messages.SendMessageRequest(
-                        peer=peer,
-                        message=response,
-                        reply_to=types.InputMessageReplyToMessage(reply_to_msg_id=msg.id)
-                    )
+                        logger.error(f"Failed to save user message to telegram_chat_messages: {e}")
                     
-                    await client(functions.InvokeWithBusinessConnectionRequest(
-                        connection_id=connection_id,
-                        query=send_msg_req
-                    ))
-                except Exception as e:
-                    logger.error(f"Failed to send response via business connection: {e}")
-                    continue
-
-                # 3. Save the bot's response to legacy chatbot_messages
-                if session_id:
+                    # Generate response
+                    response = await generate_llm_response(bot_id, user_message, user_id)
+                    
+                    # Send message via business connection
                     try:
-                        bot_msg_query = supabase.table('chatbot_messages').insert({
-                            'session_id': session_id,
+                        try:
+                            peer = await client.get_input_entity(msg.peer_id)
+                        except Exception:
+                            peer = msg.peer_id
+
+                        send_msg_req = functions.messages.SendMessageRequest(
+                            peer=peer,
+                            message=response,
+                            reply_to=types.InputMessageReplyToMessage(reply_to_msg_id=msg.id)
+                        )
+                        
+                        await client(functions.InvokeWithBusinessConnectionRequest(
+                            connection_id=connection_id,
+                            query=send_msg_req
+                        ))
+                    except Exception as e:
+                        logger.error(f"Failed to send response via business connection: {e}")
+                        continue
+
+                    # 3. Save the bot's response to legacy chatbot_messages
+                    if session_id:
+                        try:
+                            bot_msg_query = supabase.table('chatbot_messages').insert({
+                                'session_id': session_id,
+                                'role': 'assistant',
+                                'content': response
+                            })
+                            await run_supabase_query(bot_msg_query)
+                        except Exception as e:
+                            logger.error(f"Failed to save bot response to legacy chatbot_messages: {e}")
+
+                    # 4. Save the bot's response to dedicated telegram_chat_messages
+                    try:
+                        tg_bot_msg_query = supabase.table('telegram_chat_messages').insert({
+                            'bot_id': bot_id,
+                            'telegram_user_id': user_id,
+                            'user_name': user_name,
                             'role': 'assistant',
                             'content': response
                         })
-                        await run_supabase_query(bot_msg_query)
+                        await run_supabase_query(tg_bot_msg_query)
                     except Exception as e:
-                        logger.error(f"Failed to save bot response to legacy chatbot_messages: {e}")
-
-                # 4. Save the bot's response to dedicated telegram_chat_messages
-                try:
-                    tg_bot_msg_query = supabase.table('telegram_chat_messages').insert({
-                        'bot_id': bot_id,
-                        'telegram_user_id': user_id,
-                        'user_name': user_name,
-                        'role': 'assistant',
-                        'content': response
-                    })
-                    await run_supabase_query(tg_bot_msg_query)
-                except Exception as e:
-                    logger.error(f"Failed to save bot response to telegram_chat_messages: {e}")
+                        logger.error(f"Failed to save bot response to telegram_chat_messages: {e}")
+            except Exception as raw_err:
+                logger.exception(f"Error inside raw_handler for bot_id={bot_id}: {raw_err}")
 
         active_clients[bot_id] = client
         await client.run_until_disconnected()
 
+    except asyncio.CancelledError:
+        logger.info(f"LLM Bot {bot_id} start_bot task was cancelled. Shutting down client...")
+        if client:
+            try:
+                await client.disconnect()
+            except Exception as disc_err:
+                logger.error(f"Error disconnecting cancelled bot client {bot_id}: {disc_err}")
+        active_clients.pop(bot_id, None)
+        running_tasks.pop(bot_id, None)
+        raise
     except Exception as e:
         logger.exception(
             f"START_BOT FAILED bot_id={bot_id}: {repr(e)}"
         )
+        if client:
+            try:
+                await client.disconnect()
+            except Exception as disc_err:
+                logger.error(f"Error disconnecting failed bot client {bot_id}: {disc_err}")
+        active_clients.pop(bot_id, None)
+        running_tasks.pop(bot_id, None)
         raise
 
 
@@ -673,6 +685,20 @@ async def bot_runner():
                 GLOBAL_BOT_CONFIGS[bot_id] = full_config
                 current_bot_ids.add(bot_id)
                 
+                # Check if bot is already active and connected (Requirement 3)
+                if bot_id in active_clients:
+                    try:
+                        is_connected = active_clients[bot_id].is_connected()
+                    except Exception:
+                        is_connected = False
+                    if is_connected:
+                        if bot_id in running_tasks and not running_tasks[bot_id].done():
+                            logger.info(f"LLM Bot {bot_id} is already connected and task is running. Skipping start.")
+                            continue
+                        else:
+                            logger.warning(f"LLM Bot {bot_id} client is connected but task is missing or done. Resetting client...")
+                            active_clients.pop(bot_id, None)
+
                 if bot_id not in running_tasks or running_tasks[bot_id].done():
                     if bot_id in running_tasks and running_tasks[bot_id].done():
                         try:
