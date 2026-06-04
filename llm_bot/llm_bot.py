@@ -262,6 +262,7 @@ async def get_or_create_telegram_session(bot_id: str, telegram_user_id: int, use
 async def start_bot(config: dict):
     bot_id = config['bot_id']
     token = config['bot_token']
+    logger.info(f"Preparing to start bot config: bot_id={bot_id}, token_prefix={token[:10]}")
     logger.info(f"Starting LLM bot: {bot_id}")
     
     # Configure allowed updates for bot (Requirement 4)
@@ -272,7 +273,7 @@ async def start_bot(config: dict):
         client = TelegramClient(f"sessions/llm_bot_{bot_id}", API_ID, API_HASH)
         await client.start(bot_token=token)
         me = await client.get_me()
-        logger.info(f"Started bot: @{me.username}, id={me.id}, bot_id={bot_id}")
+        logger.info(f"RUNNING BOT USERNAME=@{me.username}, TG_ID={me.id}, BOT_ID={bot_id}, TOKEN_PREFIX={token[:10]}")
         
         @client.on(events.NewMessage)
         async def handler(event):
