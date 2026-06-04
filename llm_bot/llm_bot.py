@@ -271,7 +271,8 @@ async def start_bot(config: dict):
         # Load from the same sessions directory as bot.py
         client = TelegramClient(f"sessions/llm_bot_{bot_id}", API_ID, API_HASH)
         await client.start(bot_token=token)
-        logger.info(f"LLM Bot {bot_id} started successfully!")
+        me = await client.get_me()
+        logger.info(f"Started bot: @{me.username}, id={me.id}, bot_id={bot_id}")
         
         @client.on(events.NewMessage)
         async def handler(event):
@@ -385,6 +386,11 @@ async def start_bot(config: dict):
 
             # Log all incoming raw updates for tracking (Requirement 5)
             logger.info(f"LLM Bot {bot_id} (Raw Event): Received incoming update type {type(update).__name__}")
+            logger.info(f"RAW TYPE: {type(event).__name__}")
+            try:
+                logger.info(event.stringify())
+            except Exception as e:
+                logger.info(f"Could not stringify raw event: {e}")
 
             # Inspect Updates containers if matching
             updates_to_process = []
