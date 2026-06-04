@@ -272,8 +272,12 @@ async def start_bot(config: dict):
         # Load from the same sessions directory as bot.py
         client = TelegramClient(f"sessions/llm_bot_{bot_id}", API_ID, API_HASH)
         await client.start(bot_token=token)
+        import telethon
+        logger.info(f"TELETHON VERSION: {telethon.__version__}")
         me = await client.get_me()
-        logger.info(f"RUNNING BOT USERNAME=@{me.username}, TG_ID={me.id}, BOT_ID={bot_id}, TOKEN_PREFIX={token[:10]}")
+        logger.info(
+            f"BOT VERIFIED: username=@{me.username}, id={me.id}, bot_id={bot_id}"
+        )
         
         @client.on(events.NewMessage)
         async def handler(event):
@@ -380,31 +384,38 @@ async def start_bot(config: dict):
 
         @client.on(events.Raw)
         async def raw_handler(event):
-            # In Telethon events.Raw, the handler is called with the raw update object directly (Requirement 7)
+            logger.info("=" * 80)
+            logger.info(f"RAW EVENT TYPE: {type(event).__name__}")
+
+            try:
+                logger.info(event.stringify())
+            except Exception as e:
+                logger.error(f"Stringify failed: {e}")
+
+            if hasattr(event, "updates"):
+                logger.info(f"Updates container count: {len(event.updates)}")
+                for idx, upd in enumerate(event.updates):
+                    logger.info(f"NESTED UPDATE [{idx}] TYPE: {type(upd).__name__}")
+                    try:
+                        logger.info(upd.stringify())
+                    except:
+                        pass
+
+            # Inspect Updates containers if matching
             update = event
             if not update:
                 return
 
-            # Log all incoming raw updates for tracking (Requirement 5)
-            logger.info(f"LLM Bot {bot_id} (Raw Event): Received incoming update type {type(update).__name__}")
-            logger.info(f"RAW TYPE: {type(event).__name__}")
-            try:
-                logger.info(event.stringify())
-            except Exception as e:
-                logger.info(f"Could not stringify raw event: {e}")
-
-            # Inspect Updates containers if matching
             updates_to_process = []
             if isinstance(update, (types.Updates, types.UpdatesCombined)):
-                logger.info(f"LLM Bot {bot_id}: Inspecting updates container with {len(update.updates)} nested updates.")
                 for inner_update in update.updates:
-                    logger.info(f"LLM Bot {bot_id} (Nested Update): {type(inner_update).__name__}")
-                    logger.info(inner_update.stringify())
                     updates_to_process.append(inner_update)
             else:
                 updates_to_process.append(update)
 
             for u in updates_to_process:
+                logger.info(f"UPDATE CLASS = {u.__class__.__name__}")
+
                 # Support business_connection update (Requirement 2)
                 if isinstance(u, types.UpdateBotBusinessConnect):
                     connection = u.connection
@@ -435,11 +446,17 @@ async def start_bot(config: dict):
 
                 # Support business_message update (Requirement 2)
                 if not isinstance(u, types.UpdateBotNewBusinessMessage):
+                    logger.info(f"UNHANDLED RAW UPDATE CLASS: {u.__class__.__name__}")
                     continue
 
                 msg = u.message
-                if not msg or getattr(msg, 'out', False) or not getattr(msg, 'message', ''):
+                if not msg:
                     continue
+
+                logger.info(
+                    f"BUSINESS MSG DEBUG -> out={getattr(msg,'out',None)} "
+                    f"text={getattr(msg,'message',None)}"
+                )
 
                 # Extract fields (Requirement 3)
                 connection_id = u.connection_id
