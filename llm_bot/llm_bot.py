@@ -10,6 +10,7 @@ import google.generativeai as genai
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 import urllib.request
 import urllib.parse
+import urllib.error
 import json
 
 # ---- 1. Logging Setup ----
@@ -54,15 +55,17 @@ def configure_bot_allowed_updates(token: str):
         
         req = urllib.request.Request(url, data=data)
         logger.info(f"Triggering urllib request to {url}")
-        with urllib.request.urlopen(req) as response:
+        with urllib.request.urlopen(req, timeout=10) as response:
             res_data = json.loads(response.read().decode("utf-8"))
             logger.info(f"AFTER deleteWebhook request. Response: {res_data}")
             if res_data.get("ok"):
                 logger.info(f"Successfully configured allowed_updates for bot token {token[:10]}...")
             else:
                 logger.warning(f"Failed to configure allowed_updates: {res_data.get('description')}")
+    except (TimeoutError, urllib.error.URLError) as net_err:
+        logger.warning(f"deleteWebhook net error (TimeoutError/URLError) but continuing bot startup: {repr(net_err)}")
     except Exception as e:
-        logger.error(f"Error configuring bot allowed_updates: {e}")
+        logger.exception("deleteWebhook failed but continuing bot startup")
 
 API_ID = int(os.environ.get("TELEGRAM_API_ID", "12345678"))
 API_HASH = os.environ.get("TELEGRAM_API_HASH", "dummyhash")
