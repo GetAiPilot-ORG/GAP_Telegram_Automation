@@ -18,6 +18,7 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger("LLMBotManager")
+logger.info("PROCESS PID=%s", os.getpid())
 
 # Load environment variables
 load_dotenv()
@@ -42,6 +43,7 @@ GLOBAL_JOIN_BOT_IDS = set()
 
 def configure_bot_allowed_updates(token: str):
     """Ensure Bot API webhook is deleted and allowed_updates is set for MTProto (Requirement 4)"""
+    logger.info(f"BEFORE deleteWebhook request for token {token[:10]}...")
     try:
         allowed_updates = ["message", "business_connection", "business_message", "edited_business_message", "deleted_business_messages"]
         url = f"https://api.telegram.org/bot{token}/deleteWebhook"
@@ -51,8 +53,10 @@ def configure_bot_allowed_updates(token: str):
         }).encode("utf-8")
         
         req = urllib.request.Request(url, data=data)
+        logger.info(f"Triggering urllib request to {url}")
         with urllib.request.urlopen(req) as response:
             res_data = json.loads(response.read().decode("utf-8"))
+            logger.info(f"AFTER deleteWebhook request. Response: {res_data}")
             if res_data.get("ok"):
                 logger.info(f"Successfully configured allowed_updates for bot token {token[:10]}...")
             else:
@@ -265,18 +269,35 @@ async def start_bot(config: dict):
     logger.info(f"Preparing to start bot config: bot_id={bot_id}, token_prefix={token[:10]}")
     logger.info(f"Starting LLM bot: {bot_id}")
     
-    # Configure allowed updates for bot (Requirement 4)
-    configure_bot_allowed_updates(token)
-    
     try:
+        logger.info(f"ENTERING start_bot bot_id={bot_id}")
+
+        # Configure allowed updates for bot (Requirement 4)
+        logger.info(f"BEFORE configure_bot_allowed_updates for bot_id={bot_id}")
+        configure_bot_allowed_updates(token)
+        logger.info(f"AFTER configure_bot_allowed_updates for bot_id={bot_id}")
+        
         # Load from the same sessions directory as bot.py
         client = TelegramClient(f"sessions/llm_bot_{bot_id}", API_ID, API_HASH)
-        await client.start(bot_token=token)
+        
+        logger.info(f"BEFORE client.start for bot_id={bot_id}")
         import telethon
         logger.info(f"TELETHON VERSION: {telethon.__version__}")
+        
+        await asyncio.wait_for(
+            client.start(bot_token=token),
+            timeout=30
+        )
+        logger.info("client.start completed")
+        
+        logger.info(f"BEFORE client.get_me for bot_id={bot_id}")
         me = await client.get_me()
+        logger.info(f"AFTER client.get_me for bot_id={bot_id}")
+        
         logger.info(
-            f"BOT VERIFIED: username=@{me.username}, id={me.id}, bot_id={bot_id}"
+            f"BOT VERIFIED username=@{me.username} "
+            f"id={me.id} "
+            f"bot_id={bot_id}"
         )
         
         @client.on(events.NewMessage)
@@ -593,7 +614,10 @@ async def start_bot(config: dict):
         await client.run_until_disconnected()
 
     except Exception as e:
-        logger.error(f"Failed to start LLM bot {bot_id}: {e}")
+        logger.exception(
+            f"START_BOT FAILED bot_id={bot_id}: {repr(e)}"
+        )
+        raise
 
 
 async def bot_runner():
@@ -648,11 +672,23 @@ async def bot_runner():
                 
                 if bot_id not in running_tasks or running_tasks[bot_id].done():
                     if bot_id in running_tasks and running_tasks[bot_id].done():
-                        exc = running_tasks[bot_id].exception()
-                        if exc:
-                            logger.warning(f"LLM Bot {bot_id} task failed ({exc}), restarting...")
-                    task = asyncio.create_task(start_bot(full_config))
-                    running_tasks[bot_id] = task
+                        try:
+                            if running_tasks[bot_id].cancelled():
+                                logger.info(f"LLM Bot {bot_id} task was cancelled.")
+                            else:
+                                exc = running_tasks[bot_id].exception()
+                                if exc:
+                                    logger.error(f"LLM Bot {bot_id} task failed with exception: {exc}", exc_info=exc)
+                        except Exception as check_exc:
+                            logger.error(f"Error checking completed task exception for bot {bot_id}: {check_exc}")
+                    
+                    logger.info(f"Creating task for start_bot: bot_id={bot_id}")
+                    try:
+                        task = asyncio.create_task(start_bot(full_config))
+                        running_tasks[bot_id] = task
+                        logger.info(f"Task created successfully for bot_id={bot_id}")
+                    except Exception as task_err:
+                        logger.exception(f"Failed to create task for bot_id={bot_id}: {task_err}")
                     
             # Check for deleted/paused bots
             for bot_id in list(running_tasks.keys()):
