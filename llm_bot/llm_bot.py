@@ -574,31 +574,25 @@ async def start_bot(config: dict):
                         
                         # Send reply using Telegram business connection (Requirement 6)
                         try:
-                            import asyncio
-                            from telethon import functions
-                            import random
+                            import httpx
 
-                            send_req = functions.messages.SendMessageRequest(
-                                peer=peer,
-                                message=response,
-                                random_id=random.randint(-(2**63), 2**63 - 1)
-                            )
+                            bot_token = token
+                            tgt_chat_id = user_id or chat_id
 
-                            logger.info(f"BEFORE BUSINESS SEND connection_id={connection_id}, peer={peer}, response={response[:100]}")
+                            payload = {
+                                "chat_id": tgt_chat_id,
+                                "text": response,
+                                "business_connection_id": connection_id
+                            }
 
-                            result = await asyncio.wait_for(
-                                client(functions.InvokeWithBusinessConnectionRequest(
-                                    connection_id=connection_id,
-                                    query=send_req
-                                )),
-                                timeout=15
-                            )
+                            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
-                            logger.info(f"BUSINESS SEND RESULT: {result}")
+                            logger.info(f"BEFORE BUSINESS SEND BOT API chat_id={tgt_chat_id}, connection_id={connection_id}")
 
-                        except asyncio.TimeoutError:
-                            logger.exception("Business send timed out after 15 seconds")
-                            continue
+                            async with httpx.AsyncClient(timeout=15) as http:
+                                r = await http.post(url, json=payload)
+                                logger.info(f"BUSINESS SEND RESULT: status={r.status_code}, body={r.text}")
+                                r.raise_for_status()
 
                         except Exception:
                             logger.exception("Business send failed with exception")
