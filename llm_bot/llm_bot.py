@@ -82,11 +82,11 @@ async def run_supabase_query(query):
 if not os.path.exists("sessions"):
     os.makedirs("sessions")
 
-async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id: int = None) -> str:
-    """Generate a response using the configured LLM API key and conversation history from telegram_chat_messages."""
+async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id: int = None) -> tuple:
+    """Generate a response using the configured LLM API key, RAG context, and conversation history."""
     config = GLOBAL_BOT_CONFIGS.get(bot_id)
     if not config:
-        return "Sorry, my configuration is currently unavailable."
+        return "Sorry, my configuration is currently unavailable.", None
     
     if hasattr(config, "get"):
         provider = config.get("provider", "").lower()
@@ -102,6 +102,65 @@ async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id
         support_name = getattr(config, "support_name", "AI Assistant")
         knowledge_base_text = getattr(config, "knowledge_base_text", "") or ""
 
+    if not api_key:
+        return "⚠️ Setup Error: The API key for this bot has not been configured.", None
+
+    logger.info(f"generate_llm_response called: bot_id={bot_id}, telegram_user_id={telegram_user_id}, user_message={user_message[:50]}")
+
+    # Generate Query Embedding and Match Chunks / Media (RAG)
+    query_embedding = None
+    retrieved_context = ""
+    matched_image_url = None
+    matched_image_caption = None
+
+    try:
+        if "openai" in provider:
+            client = openai.AsyncOpenAI(api_key=api_key)
+            res = await client.embeddings.create(
+                input=user_message,
+                model="text-embedding-3-small"
+            )
+            query_embedding = res.data[0].embedding
+        elif "gemini" in provider:
+            genai.configure(api_key=api_key)
+            def _gemini_embed():
+                res = genai.embed_content(
+                    model="models/text-embedding-004",
+                    content=user_message
+                )
+                return res['embedding']
+            loop = asyncio.get_running_loop()
+            gemini_vector = await loop.run_in_executor(supabase_executor, _gemini_embed)
+            query_embedding = gemini_vector + [0.0] * (1536 - len(gemini_vector))
+
+        if query_embedding:
+            # Query match_bot_chunks RPC via Supabase Client
+            chunks_query = supabase.rpc("match_bot_chunks", {
+                "query_embedding": query_embedding,
+                "match_threshold": 0.3,
+                "match_count": 5,
+                "p_bot_id": bot_id
+            })
+            chunks_res = await run_supabase_query(chunks_query)
+            if chunks_res.data:
+                retrieved_context = "\n\n".join([chunk["content"] for chunk in chunks_res.data])
+                logger.info(f"RAG: Found {len(chunks_res.data)} matching text chunks.")
+
+            # Query match_bot_media RPC via Supabase Client
+            media_query = supabase.rpc("match_bot_media", {
+                "query_embedding": query_embedding,
+                "match_threshold": 0.35,
+                "match_count": 1,
+                "p_bot_id": bot_id
+            })
+            media_res = await run_supabase_query(media_query)
+            if media_res.data and len(media_res.data) > 0:
+                matched_image_url = media_res.data[0]["image_url"]
+                matched_image_caption = media_res.data[0]["caption"]
+                logger.info(f"RAG Media: Found matching image: {matched_image_url} (Caption: {matched_image_caption})")
+    except Exception as rag_err:
+        logger.error(f"Error during RAG or Embedding generation: {rag_err}", exc_info=True)
+
     # Priority:
     # 1. knowledge_base_text  → written by n8n after generating the full KB system prompt
     # 2. business_info        → raw user input (used before n8n has run, or as fallback)
@@ -113,11 +172,13 @@ async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id
         system_prompt = business_info
     else:
         system_prompt = f"Your name is {support_name}. {business_info or 'You are a helpful AI support assistant.'}"
-    
-    if not api_key:
-        return "⚠️ Setup Error: The API key for this bot has not been configured."
 
-    logger.info(f"generate_llm_response called: bot_id={bot_id}, telegram_user_id={telegram_user_id}, user_message={user_message[:50]}")
+    # Inject RAG text context
+    if retrieved_context.strip():
+        system_prompt += f"\n\n[CRITICAL INSTRUCTION: Use ONLY the following knowledge base context to answer user questions. Do not mention that you have context or a database. Keep replies concise and in brand tone.]:\n{retrieved_context}"
+
+    if matched_image_url:
+        system_prompt += f"\n\n[NOTICE: A relevant image is also being sent to the user: '{matched_image_caption}'. Acknowledge/mention this image naturally in your reply (e.g. 'You can see the details in the photo below:').]"
 
     # Fetch conversation history from dedicated telegram_chat_messages table
     history = []
@@ -169,12 +230,10 @@ async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id
                 messages=messages,
                 max_tokens=600
             )
-            return response.choices[0].message.content
+            return response.choices[0].message.content, matched_image_url
 
         # ---- Gemini Handler ----
         elif "gemini" in provider:
-            # Re-configure for each call since genai uses global config in older versions,
-            # or pass api_key directly to GenerativeModel if supported.
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel('gemini-1.5-flash',
                                         system_instruction=system_prompt)
@@ -212,20 +271,21 @@ async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id
                     raise
                 
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(supabase_executor, _generate)
+            result_text = await loop.run_in_executor(supabase_executor, _generate)
+            return result_text, matched_image_url
 
         else:
-            return f"⚠️ Unsupported AI provider: {provider}"
+            return f"⚠️ Unsupported AI provider: {provider}", None
             
     except Exception as e:
         error_msg = str(e).lower()
         if "api key" in error_msg or "unauthorized" in error_msg or "authentication" in error_msg or "invalid_api_key" in error_msg:
-            return "⚠️ Setup Error: The provided LLM API key is invalid or has expired. Please update it in the dashboard dashboard."
+            return "⚠️ Setup Error: The provided LLM API key is invalid or has expired. Please update it in the dashboard dashboard.", None
         elif "quota" in error_msg or "rate limit" in error_msg:
-            return "⚠️ Service Error: The LLM provider quota has been exceeded or rate-limited."
+            return "⚠️ Service Error: The LLM provider quota has been exceeded or rate-limited.", None
         else:
             logger.error(f"LLM Error for bot {bot_id}: {e}")
-            return "⚠️ An error occurred while generating a response. Please try again later."
+            return "⚠️ An error occurred while generating a response. Please try again later.", None
 
 async def get_or_create_telegram_session(bot_id: str, telegram_user_id: int, user_name: str) -> str:
     """Find or create a chatbot session for a Telegram user chatting with a specific bot."""
@@ -377,8 +437,16 @@ async def start_bot(config: dict):
             
             # Show "typing..." status and get response
             async with client.action(event.chat_id, 'typing'):
-                response = await generate_llm_response(bot_id, user_message, user_id)
-                await event.respond(response)
+                response_text, matched_image_url = await generate_llm_response(bot_id, user_message, user_id)
+                
+                if matched_image_url:
+                    try:
+                        await client.send_file(event.chat_id, file=matched_image_url, caption=response_text)
+                    except Exception as send_file_err:
+                        logger.error(f"Failed to send image file via Telethon, falling back to text: {send_file_err}")
+                        await event.respond(response_text)
+                else:
+                    await event.respond(response_text)
                 
                 # 3. Save the bot's response to legacy chatbot_messages
                 if session_id:
@@ -386,7 +454,7 @@ async def start_bot(config: dict):
                         bot_msg_query = supabase.table('chatbot_messages').insert({
                             'session_id': session_id,
                             'role': 'assistant',
-                            'content': response
+                            'content': response_text
                         })
                         await run_supabase_query(bot_msg_query)
                     except Exception as e:
@@ -399,7 +467,7 @@ async def start_bot(config: dict):
                         'telegram_user_id': user_id,
                         'user_name': user_name,
                         'role': 'assistant',
-                        'content': response
+                        'content': response_text
                     })
                     await run_supabase_query(tg_bot_msg_query)
                 except Exception as e:
@@ -570,7 +638,7 @@ async def start_bot(config: dict):
                             logger.error(f"Failed to save user message to telegram_chat_messages: {e}")
                         
                         # Generate response
-                        response = await generate_llm_response(bot_id, user_message, user_id)
+                        response_text, matched_image_url = await generate_llm_response(bot_id, user_message, user_id)
                         
                         # Send reply using Telegram business connection (Requirement 6)
                         try:
@@ -579,13 +647,21 @@ async def start_bot(config: dict):
                             bot_token = token
                             tgt_chat_id = user_id or chat_id
 
-                            payload = {
-                                "chat_id": tgt_chat_id,
-                                "text": response,
-                                "business_connection_id": connection_id
-                            }
-
-                            url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                            if matched_image_url:
+                                payload = {
+                                    "chat_id": tgt_chat_id,
+                                    "photo": matched_image_url,
+                                    "caption": response_text,
+                                    "business_connection_id": connection_id
+                                }
+                                url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+                            else:
+                                payload = {
+                                    "chat_id": tgt_chat_id,
+                                    "text": response_text,
+                                    "business_connection_id": connection_id
+                                }
+                                url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
 
                             logger.info(f"BEFORE BUSINESS SEND BOT API chat_id={tgt_chat_id}, connection_id={connection_id}")
 
@@ -604,7 +680,7 @@ async def start_bot(config: dict):
                                 bot_msg_query = supabase.table('chatbot_messages').insert({
                                     'session_id': session_id,
                                     'role': 'assistant',
-                                    'content': response
+                                    'content': response_text
                                 })
                                 await run_supabase_query(bot_msg_query)
                             except Exception as e:
@@ -617,7 +693,7 @@ async def start_bot(config: dict):
                                 'telegram_user_id': user_id,
                                 'user_name': user_name,
                                 'role': 'assistant',
-                                'content': response
+                                'content': response_text
                             })
                             await run_supabase_query(tg_bot_msg_query)
                         except Exception as e:
