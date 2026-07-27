@@ -776,7 +776,7 @@ async def guard_or_hint(e) -> bool:
         "✅ First purchase a plan from the dashboard, then you can use the bot.\n"
         "If already purchased, ensure your Telegram User ID is linked in the dashboard.\n\n"
         "Use: /my_id (to see your Telegram ID)",
-        buttons=btns
+        buttons=btns if btns else None
     )
     return False
 
