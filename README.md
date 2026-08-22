@@ -2,6 +2,8 @@
 
 Welcome to the **GAP Telegram Automation Suite**—a comprehensive, multi-tenant ecosystem designed to automate subscriptions, message forwarding, marketing broadcasts, drip campaigns, and AI customer support across Telegram groups and channels, fully integrated with a Supabase database backend and a web dashboard.
 
+init
+
 ---
 
 ## 📂 Table of Contents
