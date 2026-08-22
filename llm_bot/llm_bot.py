@@ -186,31 +186,10 @@ async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id
     system_prompt += """
 
 === MANDATORY MEMORY & CONVERSATION CONTINUITY RULES ===
-1. DEEP CONVERSATION MEMORY:
-   - You MUST read and remember the entire conversation history with this user right above.
-   - Extract and retain all user details: User's Name, Phone/WhatsApp Number, Business/Product, Budget (e.g. ₹10,000/day), Specific Services (e.g. Video Ads, Performance Marketing).
-   - If the user already provided their Name, Phone, and Requirements, DO NOT re-ask for them, and DO NOT re-qualify them from scratch.
-
-2. POST-LEAD COLLECTION & FOLLOW-UP QUESTIONS:
-   - If the user's contact details (Name & Phone) are already in history and they ask follow-up questions (e.g. "What about video?", "Kab call aayegi?", "Next step kya hai?", "How will it work?"):
-     → Address the user by Name (e.g. "Shwet").
-     → Explicitly reference their stated requirement (e.g. "Aapne daily ₹10k budget ke saath ads chalwane aur video banwane ki request ki hai...").
-     → Explain the next step: our creative team will connect on their WhatsApp number with video concepts, scripts, and shoot details.
-     → DO NOT dump a generic catalog list or re-ask "kis type ki video chahiye".
-
-3. HANDLING "TUMHE PATA HAI" / "YOU ALREADY KNOW" / "I TOLD YOU":
-   - If the user says "tumhe pata hai", "maine bataya toh tha", "you know this", or refers to earlier messages:
-     → IMMEDIATELY look at previous turns in the history.
-     → Explicitly recall and state what they told you (e.g. "Haan Shwet, aapne bataya tha ki aapko daily ₹10,000 ad budget ke saath video banwani aur ad chalwani hai!").
-     → Reassure them that their requirements are already noted and the team will discuss the exact creative style directly with them on WhatsApp.
-
-4. GREETINGS & SHORT PROMPTS IN ONGOING CHATS:
-   - If the user says "hi", "hello", "hey" mid-conversation, NEVER say generic blank greetings ("Hello! How can we assist you today?").
-   - Instead say: "Hey [Name]! We were discussing [last topic]. How can I help you proceed?"
-
-5. TONE & FORMAT:
-   - Keep answers natural, human, confident, and concise (2-3 short sentences).
-   - Match the user's language (Hinglish/English).
+1. CONVERSATION HISTORY MEMORY: You have the previous conversation history with this user right above. Always remember what was previously discussed, the user's requirements, chosen services, budget, name, and intent.
+2. GREETINGS IN ONGOING CHATS: If the user says "hi", "hello", "hey", or greets you after you have already been talking, NEVER reset or restart with a generic blank greeting (like "Hello! How can we assist you today?"). Instead, acknowledge them warmly and continue directly from where you left off (e.g., "Hey! We were talking about your video ads. Which platform did you want to start with?" or "Hello! Ready to move forward with the ad plan, or did you have any other questions?").
+3. NEVER REPEAT QUALIFICATION: Do NOT re-ask questions that the user already answered earlier in the chat.
+4. TONE & STYLE: Keep replies short (1-2 sentences), conversational, helpful, and moving forward toward the next actionable step.
 """
 
     # Fetch conversation history from dedicated telegram_chat_messages table (persisted across days)
