@@ -91,16 +91,17 @@ async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id
     if hasattr(config, "get"):
         provider = config.get("provider", "").lower()
         api_key = config.get("api_key")
-        business_info = config.get("business_info", "")
+        business_info = config.get("business_info", "") or ""
         support_name = config.get("support_name", "AI Assistant")
-        # knowledge_base_text is the n8n-generated full system prompt
         knowledge_base_text = config.get("knowledge_base_text") or ""
+        system_prompt_custom = config.get("system_prompt") or ""
     else:
         provider = getattr(config, "provider", "").lower()
         api_key = getattr(config, "api_key", None)
-        business_info = getattr(config, "business_info", "")
+        business_info = getattr(config, "business_info", "") or ""
         support_name = getattr(config, "support_name", "AI Assistant")
         knowledge_base_text = getattr(config, "knowledge_base_text", "") or ""
+        system_prompt_custom = getattr(config, "system_prompt", "") or ""
 
     if not api_key:
         return "⚠️ Setup Error: The API key for this bot has not been configured.", None
@@ -161,28 +162,37 @@ async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id
     except Exception as rag_err:
         logger.error(f"Error during RAG or Embedding generation: {rag_err}", exc_info=True)
 
-    # Priority:
-    # 1. knowledge_base_text  → written by n8n after generating the full KB system prompt
-    # 2. business_info        → raw user input (used before n8n has run, or as fallback)
-    # 3. Generic fallback
-    if knowledge_base_text and knowledge_base_text.strip():
-        system_prompt = knowledge_base_text
-    elif business_info and business_info.strip():
-        if len(business_info) > 200:
-            system_prompt = business_info
-        else:
-            system_prompt = f"Your name is {support_name}.\n\nBusiness Info:\n{business_info}"
+    # 1. Base System Prompt
+    if system_prompt_custom and system_prompt_custom.strip():
+        system_prompt = system_prompt_custom.strip()
+    elif business_info and len(business_info) > 200:
+        system_prompt = f"Your name is {support_name}.\n\n{business_info}"
     else:
-        system_prompt = f"Your name is {support_name}. You are a helpful AI support assistant."
+        system_prompt = f"Your name is {support_name}. You are a professional AI consultant and assistant."
 
-    # Inject RAG text context
+    # 2. Append Knowledge Base section if present and not already duplicated
+    kb_content = (knowledge_base_text or business_info or "").strip()
+    if kb_content and kb_content not in system_prompt:
+        system_prompt += f"\n\n=== KNOWLEDGE BASE ===\n{kb_content}\n=== END KNOWLEDGE BASE ==="
+
+    # 3. Inject RAG text context
     if retrieved_context.strip():
-        system_prompt += f"\n\n[CRITICAL INSTRUCTION: Use ONLY the following knowledge base context to answer user questions. Do not mention that you have context or a database. Keep replies concise and in brand tone.]:\n{retrieved_context}"
+        system_prompt += f"\n\n=== RELEVANT CONTEXT (RAG) ===\n{retrieved_context}\n=== END RELEVANT CONTEXT ==="
 
     if matched_image_url:
         system_prompt += f"\n\n[NOTICE: A relevant image is also being sent to the user: '{matched_image_caption}'. Acknowledge/mention this image naturally in your reply (e.g. 'You can see the details in the photo below:').]"
 
-    # Fetch conversation history from dedicated telegram_chat_messages table
+    # 4. Mandatory Multi-Turn Memory & Continuity Instruction
+    system_prompt += """
+
+=== MANDATORY MEMORY & CONVERSATION CONTINUITY RULES ===
+1. CONVERSATION HISTORY MEMORY: You have the previous conversation history with this user right above. Always remember what was previously discussed, the user's requirements, chosen services, budget, name, and intent.
+2. GREETINGS IN ONGOING CHATS: If the user says "hi", "hello", "hey", or greets you after you have already been talking, NEVER reset or restart with a generic blank greeting (like "Hello! How can we assist you today?"). Instead, acknowledge them warmly and continue directly from where you left off (e.g., "Hey! We were talking about your video ads. Which platform did you want to start with?" or "Hello! Ready to move forward with the ad plan, or did you have any other questions?").
+3. NEVER REPEAT QUALIFICATION: Do NOT re-ask questions that the user already answered earlier in the chat.
+4. TONE & STYLE: Keep replies short (1-2 sentences), conversational, helpful, and moving forward toward the next actionable step.
+"""
+
+    # Fetch conversation history from dedicated telegram_chat_messages table (persisted across days)
     history = []
     if telegram_user_id:
         try:
@@ -227,9 +237,10 @@ async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id
                 logger.info(f"  OpenAI msg [{idx}] role={msg.get('role')}: {msg.get('content')[:100]}...")
 
             response = await client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model="gpt-4o-mini",
                 messages=messages,
-                max_tokens=600
+                max_tokens=600,
+                temperature=0.7
             )
             return response.choices[0].message.content, matched_image_url
 
