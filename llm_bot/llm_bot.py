@@ -165,13 +165,15 @@ async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id
     # 1. knowledge_base_text  → written by n8n after generating the full KB system prompt
     # 2. business_info        → raw user input (used before n8n has run, or as fallback)
     # 3. Generic fallback
-    if knowledge_base_text.strip():
+    if knowledge_base_text and knowledge_base_text.strip():
         system_prompt = knowledge_base_text
-    elif business_info and len(business_info) > 200:
-        # Legacy: full prompt was stored directly in business_info
-        system_prompt = business_info
+    elif business_info and business_info.strip():
+        if len(business_info) > 200:
+            system_prompt = business_info
+        else:
+            system_prompt = f"Your name is {support_name}.\n\nBusiness Info:\n{business_info}"
     else:
-        system_prompt = f"Your name is {support_name}. {business_info or 'You are a helpful AI support assistant.'}"
+        system_prompt = f"Your name is {support_name}. You are a helpful AI support assistant."
 
     # Inject RAG text context
     if retrieved_context.strip():
@@ -197,7 +199,7 @@ async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id
                 for idx, msg in enumerate(history):
                     logger.info(f"  History msg [{idx}] - {msg.get('role')}: {msg.get('content')[:60]}...")
             else:
-                logger.warning(f"No history messages found for user {telegram_user_id} in telegram_chat_messages.")
+                logger.info(f"No prior history found for user {telegram_user_id} in telegram_chat_messages.")
         except Exception as e:
             logger.error(f"Failed to fetch chat history for user {telegram_user_id}: {e}")
     else:
@@ -210,23 +212,22 @@ async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id
             
             messages = [{"role": "system", "content": system_prompt}]
             
-            # Format and append history
-            has_current_message = False
+            # Format and append previous history
             for msg in history:
-                messages.append({"role": msg.get("role"), "content": msg.get("content")})
-                if msg.get("role") == "user" and msg.get("content") == user_message:
-                    has_current_message = True
+                role = msg.get("role")
+                content = (msg.get("content") or "").strip()
+                if content and role in ("user", "assistant"):
+                    messages.append({"role": role, "content": content})
             
-            # If the current message wasn't in history, append it
-            if not has_current_message:
-                messages.append({"role": "user", "content": user_message})
+            # Append the current incoming user message
+            messages.append({"role": "user", "content": user_message})
 
             logger.info(f"Sending {len(messages)} messages to OpenAI for bot {bot_id}:")
             for idx, msg in enumerate(messages):
                 logger.info(f"  OpenAI msg [{idx}] role={msg.get('role')}: {msg.get('content')[:100]}...")
 
             response = await client.chat.completions.create(
-                model="gpt-3.5-turbo", # Default fast model
+                model="gpt-3.5-turbo",
                 messages=messages,
                 max_tokens=600
             )
@@ -237,7 +238,6 @@ async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id
             genai.configure(api_key=api_key)
             model = genai.GenerativeModel('gemini-1.5-flash',
                                         system_instruction=system_prompt)
-            # Disable safety settings which often block legitimate business queries
             safety_settings = {
                 HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
                 HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
@@ -245,23 +245,32 @@ async def generate_llm_response(bot_id: str, user_message: str, telegram_user_id
                 HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
             }
             
+            # Gemini strictly requires alternating turns starting with "user"
             gemini_contents = []
-            has_current_message = False
             for msg in history:
                 role = "model" if msg.get("role") == "assistant" else "user"
-                gemini_contents.append({"role": role, "parts": [msg.get("content")]})
-                if msg.get("role") == "user" and msg.get("content") == user_message:
-                    has_current_message = True
+                content = (msg.get("content") or "").strip()
+                if not content:
+                    continue
+                # Cannot start conversation with model
+                if not gemini_contents and role == "model":
+                    continue
+                # Merge consecutive messages with identical role to prevent Gemini 400 error
+                if gemini_contents and gemini_contents[-1]["role"] == role:
+                    gemini_contents[-1]["parts"][0] += f"\n{content}"
+                else:
+                    gemini_contents.append({"role": role, "parts": [content]})
             
-            # If current message wasn't in history, append it
-            if not has_current_message:
+            # Append current user message (or merge if last was user)
+            if gemini_contents and gemini_contents[-1]["role"] == "user":
+                gemini_contents[-1]["parts"][0] += f"\n{user_message}"
+            else:
                 gemini_contents.append({"role": "user", "parts": [user_message]})
 
             logger.info(f"Sending {len(gemini_contents)} turns to Gemini for bot {bot_id}:")
             for idx, turn in enumerate(gemini_contents):
                 logger.info(f"  Gemini turn [{idx}] role={turn.get('role')}: {turn.get('parts')[0][:100]}...")
 
-            # Since genai usually runs synchronously, run in executor
             def _generate():
                 try:
                     res = model.generate_content(gemini_contents, safety_settings=safety_settings)
@@ -365,6 +374,10 @@ async def start_bot(config: dict):
         
         @client.on(events.NewMessage)
         async def handler(event):
+            # Ignore outgoing messages sent by the bot itself
+            if getattr(event, 'out', False):
+                return
+
             # Only respond to private messages
             if not event.is_private:
                 return
@@ -410,31 +423,6 @@ async def start_bot(config: dict):
             except Exception as e:
                 logger.error(f"Failed to resolve session ID for Telegram chat: {e}")
 
-            # 1. Save the user's message to legacy chatbot_messages
-            if session_id:
-                try:
-                    user_msg_query = supabase.table('chatbot_messages').insert({
-                        'session_id': session_id,
-                        'role': 'user',
-                        'content': user_message
-                    })
-                    await run_supabase_query(user_msg_query)
-                except Exception as e:
-                    logger.error(f"Failed to save user message to legacy chatbot_messages: {e}")
-            
-            # 2. Save the user's message to dedicated telegram_chat_messages
-            try:
-                tg_user_msg_query = supabase.table('telegram_chat_messages').insert({
-                    'bot_id': bot_id,
-                    'telegram_user_id': user_id,
-                    'user_name': user_name,
-                    'role': 'user',
-                    'content': user_message
-                })
-                await run_supabase_query(tg_user_msg_query)
-            except Exception as e:
-                logger.error(f"Failed to save user message to telegram_chat_messages: {e}")
-            
             # Show "typing..." status and get response
             async with client.action(event.chat_id, 'typing'):
                 response_text, matched_image_url = await generate_llm_response(bot_id, user_message, user_id)
@@ -448,27 +436,24 @@ async def start_bot(config: dict):
                 else:
                     await event.respond(response_text)
                 
-                # 3. Save the bot's response to legacy chatbot_messages
+                # 1. Save user message and bot response to legacy chatbot_messages
                 if session_id:
                     try:
-                        bot_msg_query = supabase.table('chatbot_messages').insert({
-                            'session_id': session_id,
-                            'role': 'assistant',
-                            'content': response_text
-                        })
-                        await run_supabase_query(bot_msg_query)
+                        await run_supabase_query(supabase.table('chatbot_messages').insert([
+                            {'session_id': session_id, 'role': 'user', 'content': user_message},
+                            {'session_id': session_id, 'role': 'assistant', 'content': response_text}
+                        ]))
                     except Exception as e:
-                        logger.error(f"Failed to save bot response to legacy chatbot_messages: {e}")
+                        logger.error(f"Failed to save to legacy chatbot_messages: {e}")
 
-                # 4. Save the bot's response to dedicated telegram_chat_messages
+                # 2. Save user message and bot response to dedicated telegram_chat_messages
                 try:
-                    tg_bot_msg_query = supabase.table('telegram_chat_messages').insert({
-                        'bot_id': bot_id,
-                        'telegram_user_id': user_id,
-                        'user_name': user_name,
-                        'role': 'assistant',
-                        'content': response_text
-                    })
+                    await run_supabase_query(supabase.table('telegram_chat_messages').insert([
+                        {'bot_id': bot_id, 'telegram_user_id': user_id, 'user_name': user_name, 'role': 'user', 'content': user_message},
+                        {'bot_id': bot_id, 'telegram_user_id': user_id, 'user_name': user_name, 'role': 'assistant', 'content': response_text}
+                    ]))
+                except Exception as e:
+                    logger.error(f"Failed to save to telegram_chat_messages: {e}")
                     await run_supabase_query(tg_bot_msg_query)
                 except Exception as e:
                     logger.error(f"Failed to save bot response to telegram_chat_messages: {e}")
@@ -548,6 +533,11 @@ async def start_bot(config: dict):
                             logger.info("Skipping business update because message is missing")
                             continue
 
+                        # CRITICAL: Ignore outgoing messages (sent by the business or bot itself)
+                        if getattr(msg, 'out', False):
+                            logger.info("Skipping business message because msg.out=True (outgoing message)")
+                            continue
+
                         logger.info(
                             f"BUSINESS MSG DEBUG -> out={getattr(msg, 'out', None)}, "
                             f"text={getattr(msg, 'message', None)}, "
@@ -612,31 +602,6 @@ async def start_bot(config: dict):
                         except Exception as e:
                             logger.error(f"Failed to resolve session ID for Telegram chat: {e}")
 
-                        # 1. Save the user's message to legacy chatbot_messages
-                        if session_id:
-                            try:
-                                user_msg_query = supabase.table('chatbot_messages').insert({
-                                    'session_id': session_id,
-                                    'role': 'user',
-                                    'content': user_message
-                                })
-                                await run_supabase_query(user_msg_query)
-                            except Exception as e:
-                                logger.error(f"Failed to save user message to legacy chatbot_messages: {e}")
-                        
-                        # 2. Save the user's message to dedicated telegram_chat_messages
-                        try:
-                            tg_user_msg_query = supabase.table('telegram_chat_messages').insert({
-                                    'bot_id': bot_id,
-                                    'telegram_user_id': user_id,
-                                    'user_name': user_name,
-                                    'role': 'user',
-                                    'content': user_message
-                                })
-                            await run_supabase_query(tg_user_msg_query)
-                        except Exception as e:
-                            logger.error(f"Failed to save user message to telegram_chat_messages: {e}")
-                        
                         # Generate response
                         response_text, matched_image_url = await generate_llm_response(bot_id, user_message, user_id)
                         
@@ -674,30 +639,24 @@ async def start_bot(config: dict):
                             logger.exception("Business send failed with exception")
                             continue
 
-                        # 3. Save the bot's response to legacy chatbot_messages
+                        # 1. Save user message and bot response to legacy chatbot_messages
                         if session_id:
                             try:
-                                bot_msg_query = supabase.table('chatbot_messages').insert({
-                                    'session_id': session_id,
-                                    'role': 'assistant',
-                                    'content': response_text
-                                })
-                                await run_supabase_query(bot_msg_query)
+                                await run_supabase_query(supabase.table('chatbot_messages').insert([
+                                    {'session_id': session_id, 'role': 'user', 'content': user_message},
+                                    {'session_id': session_id, 'role': 'assistant', 'content': response_text}
+                                ]))
                             except Exception as e:
-                                logger.error(f"Failed to save bot response to legacy chatbot_messages: {e}")
+                                logger.error(f"Failed to save to legacy chatbot_messages: {e}")
 
-                        # 4. Save the bot's response to dedicated telegram_chat_messages
+                        # 2. Save user message and bot response to dedicated telegram_chat_messages
                         try:
-                            tg_bot_msg_query = supabase.table('telegram_chat_messages').insert({
-                                'bot_id': bot_id,
-                                'telegram_user_id': user_id,
-                                'user_name': user_name,
-                                'role': 'assistant',
-                                'content': response_text
-                            })
-                            await run_supabase_query(tg_bot_msg_query)
+                            await run_supabase_query(supabase.table('telegram_chat_messages').insert([
+                                {'bot_id': bot_id, 'telegram_user_id': user_id, 'user_name': user_name, 'role': 'user', 'content': user_message},
+                                {'bot_id': bot_id, 'telegram_user_id': user_id, 'user_name': user_name, 'role': 'assistant', 'content': response_text}
+                            ]))
                         except Exception as e:
-                            logger.error(f"Failed to save bot response to telegram_chat_messages: {e}")
+                            logger.error(f"Failed to save to telegram_chat_messages: {e}")
 
                     else:
                         logger.info(f"Unknown update class: {u.__class__.__name__}")
