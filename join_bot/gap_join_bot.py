@@ -108,7 +108,7 @@ async def start_bot(token: str, bot_id: str):
                 
                 # Removed the duplicate 'if not supabase: await event.respond...' block
                 # 1. Fetch the bot join link configuration with its mapping
-                link_res = await supabase.table('bot_join_links').select('*, mapping:bot_channel_mappings(*)').eq('slug', payload).eq('bot_id', bot_id).execute()
+                link_res = await supabase.table('tg_bot_join_links').select('*, mapping:bot_channel_mappings(*)').eq('slug', payload).eq('bot_id', bot_id).execute()
                 
                 if link_res.data:
                     link_config = link_res.data[0]
@@ -120,7 +120,7 @@ async def start_bot(token: str, bot_id: str):
                     # Resilience: If join failed but we have mapping_id, fetch it explicitly
                     if not mapping and link_config.get('channel_mapping_id'):
                         try:
-                            m_res = await supabase.table('bot_channel_mappings').select('*').eq('id', link_config['channel_mapping_id']).execute()
+                            m_res = await supabase.table('tg_bot_channel_mappings').select('*').eq('id', link_config['channel_mapping_id']).execute()
                             if m_res.data:
                                 mapping = m_res.data[0]
                         except: pass
@@ -128,7 +128,7 @@ async def start_bot(token: str, bot_id: str):
                     # Deep resilience: if still no mapping, take the first active one for this bot
                     if not mapping:
                         try:
-                            m_res = await supabase.table('bot_channel_mappings').select('*').eq('bot_id', bot_id).eq('status', 'Active').limit(1).execute()
+                            m_res = await supabase.table('tg_bot_channel_mappings').select('*').eq('bot_id', bot_id).eq('status', 'Active').limit(1).execute()
                             if m_res.data:
                                 mapping = m_res.data[0]
                         except: pass
@@ -186,7 +186,7 @@ async def start_bot(token: str, bot_id: str):
 
                                 # Save the generated link back to the mapping
                                 if channel_link_str and channel_link_str != "https://t.me/" and mapping and mapping.get('id'):
-                                    await supabase.table('bot_channel_mappings').update({"invite_link": channel_link_str}).eq('id', mapping['id']).execute()
+                                    await supabase.table('tg_bot_channel_mappings').update({"invite_link": channel_link_str}).eq('id', mapping['id']).execute()
                                     logger.info(f"Bot {bot_id}: Saved new link: {channel_link_str}")
                         except Exception as eOuter:
                             logger.error(f"Bot {bot_id}: Critical error processing channel link: {eOuter}")
@@ -194,7 +194,7 @@ async def start_bot(token: str, bot_id: str):
                     # Log the start event in bot_join_users
                     try:
                         # Check for existing record to preserve history
-                        existing_res = await supabase.table('bot_join_users').select('*').eq('link_id', link_id).eq('telegram_user_id', str(user_id)).execute()
+                        existing_res = await supabase.table('tg_bot_join_users').select('*').eq('link_id', link_id).eq('telegram_user_id', str(user_id)).execute()
                         existing_data = getattr(existing_res, 'data', []) or []
                         current_status = existing_data[0].get('status') if existing_data else None
                         
@@ -224,7 +224,7 @@ async def start_bot(token: str, bot_id: str):
                                 upsert_data["status"] = "bot_started"
                             
                         # Perform upsert
-                        await supabase.table('bot_join_users').upsert(upsert_data, on_conflict="link_id,telegram_user_id").execute()
+                        await supabase.table('tg_bot_join_users').upsert(upsert_data, on_conflict="link_id,telegram_user_id").execute()
                         logger.info(f"Bot {bot_id}: upserted user {user_id}. Status → {'active' if already_joined else current_status or 'bot_started'}")
                     except Exception as log_err:
                         logger.error(f"Failed to log bot start: {log_err}")
@@ -290,7 +290,7 @@ async def start_bot(token: str, bot_id: str):
                         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
                         # Check previous status + rejoin_count and left_channel flag to detect REJOIN
-                        prev_res = await supabase.table('bot_join_users').select('status, rejoin_count, left_channel').eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
+                        prev_res = await supabase.table('tg_bot_join_users').select('status, rejoin_count, left_channel').eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
                         prev_data = getattr(prev_res, 'data', []) or []
 
                         update_data = {
@@ -312,7 +312,7 @@ async def start_bot(token: str, bot_id: str):
                         else:
                             logger.info(f"Bot {bot_id}: Updated record for user {user_tg_id} as ACTIVE.")
 
-                        await supabase.table('bot_join_users').update(update_data).eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
+                        await supabase.table('tg_bot_join_users').update(update_data).eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
                     except Exception as log_err:
                         logger.error(f"Failed to update channel join stats: {log_err}")
 
@@ -326,7 +326,7 @@ async def start_bot(token: str, bot_id: str):
                         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
                         # Update ALL records to mark them as Leaved
                         # Clear rejoined_at — user left again so rejoin state is no longer active
-                        await supabase.table('bot_join_users').update({
+                        await supabase.table('tg_bot_join_users').update({
                             "left_channel": True,
                             "left_at": now_iso,
                             "joined_channel": False,
@@ -349,7 +349,7 @@ async def start_bot(token: str, bot_id: str):
                 user_tg_id = str(event.user_id)
                 logger.info(f"Bot {bot_id}: JOIN REQUEST received from user {user_tg_id}")
                 # Status: user has sent the request but hasn't been approved/joined yet → pending
-                await supabase.table('bot_join_users').update({
+                await supabase.table('tg_bot_join_users').update({
                     "status": "pending",
                 }).eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
                 logger.info(f"Bot {bot_id}: Set status=pending for user {user_tg_id} (join request received).")
@@ -415,7 +415,7 @@ async def start_bot(token: str, bot_id: str):
                     logger.info(f"Bot {bot_id}: Detected message in Channel '{channel_name}' ({full_channel_id}). Adding to list...")
                     
                     try:
-                        await supabase.table('bot_detected_channels').upsert({
+                        await supabase.table('tg_bot_detected_channels').upsert({
                             'bot_id': bot_id,
                             'channel_id': str(full_channel_id),
                             'channel_name': channel_name,
@@ -448,7 +448,7 @@ async def start_bot(token: str, bot_id: str):
 
                     # Fetch all candidates: status is bot_started or leaved
                     # Skip users who have blocked the bot (is_bot_blocked = true)
-                    remind_res = await supabase.table('bot_join_users')\
+                    remind_res = await supabase.table('tg_bot_join_users')\
                         .select('*, link:bot_join_links(*)')\
                         .eq('bot_id', bot_id)\
                         .in_('status', ['bot_started', 'leaved'])\
@@ -490,7 +490,7 @@ async def start_bot(token: str, bot_id: str):
                             # Fetch the invite link from the original channel mapping
                             invite_link_str = "https://t.me/"
                             if link_config.get('channel_mapping_id'):
-                                m_res = await supabase.table('bot_channel_mappings')\
+                                m_res = await supabase.table('tg_bot_channel_mappings')\
                                     .select('invite_link')\
                                     .eq('id', link_config['channel_mapping_id'])\
                                     .execute()
@@ -534,7 +534,7 @@ async def start_bot(token: str, bot_id: str):
                                     )
 
                                 # Update last_reminded_at so next reminder is 12h from now
-                                await supabase.table('bot_join_users')\
+                                await supabase.table('tg_bot_join_users')\
                                     .update({'last_reminded_at': now.isoformat(), 'reminder_sent': True})\
                                     .eq('id', user_record['id'])\
                                     .execute()
@@ -552,7 +552,7 @@ async def start_bot(token: str, bot_id: str):
                                         f"Bot {bot_id}: User {user_tg_id} has BLOCKED the bot. "
                                         f"Setting is_bot_blocked=True to skip future reminders."
                                     )
-                                    await supabase.table('bot_join_users')\
+                                    await supabase.table('tg_bot_join_users')\
                                         .update({'is_bot_blocked': True})\
                                         .eq('id', user_record['id'])\
                                         .execute()
@@ -597,7 +597,7 @@ async def process_task(task):
         message_data = task['message_data']
         
         # 1. Fetch channel mappings to see which bots are mapped to this channel
-        mapping_res = await supabase.table('bot_channel_mappings').select('*').eq('channel_id', target_channel_id).eq('status', 'Active').execute()
+        mapping_res = await supabase.table('tg_bot_channel_mappings').select('*').eq('channel_id', target_channel_id).eq('status', 'Active').execute()
         mappings = getattr(mapping_res, 'data', []) or []
         
         for mapping in mappings:
@@ -608,34 +608,34 @@ async def process_task(task):
                 client = active_clients[bot_id]
                 
                 # Check/Initialize progress
-                prog_res = await supabase.table('bot_broadcast_progress').select('*').eq('task_id', task_id).eq('bot_id', bot_id).execute()
+                prog_res = await supabase.table('tg_bot_broadcast_progress').select('*').eq('task_id', task_id).eq('bot_id', bot_id).execute()
                 prog_data = getattr(prog_res, 'data', [])
                 if prog_data:
                     if prog_data[0]['status'] != 'pending': continue
                 else:
-                    await supabase.table('bot_broadcast_progress').insert({'task_id': task_id, 'bot_id': bot_id, 'status': 'processing'}).execute()
+                    await supabase.table('tg_bot_broadcast_progress').insert({'task_id': task_id, 'bot_id': bot_id, 'status': 'processing'}).execute()
                 
                 # Fetch target users
                 # Resilience: Try specific mapping first, then all links for this bot if none found
-                links_res = await supabase.table('bot_join_links').select('id').eq('bot_id', bot_id).eq('channel_mapping_id', mapping_pk).execute()
+                links_res = await supabase.table('tg_bot_join_links').select('id').eq('bot_id', bot_id).eq('channel_mapping_id', mapping_pk).execute()
                 link_ids = [l['id'] for l in getattr(links_res, 'data', [])]
                 
                 if not link_ids:
                     # Fallback: find any link for this bot that might not have channel_mapping_id set but belongs here
                     logger.info(f"Bot {bot_id}: No recipients found for mapping {mapping_pk}. Falling back to all bot links.")
-                    links_res = await supabase.table('bot_join_links').select('id').eq('bot_id', bot_id).execute()
+                    links_res = await supabase.table('tg_bot_join_links').select('id').eq('bot_id', bot_id).execute()
                     link_ids = [l['id'] for l in getattr(links_res, 'data', [])]
 
                 if not link_ids:
-                    await supabase.table('bot_broadcast_progress').update({'status': 'completed', 'error_log': 'No links'}).eq('task_id', task_id).eq('bot_id', bot_id).execute()
+                    await supabase.table('tg_bot_broadcast_progress').update({'status': 'completed', 'error_log': 'No links'}).eq('task_id', task_id).eq('bot_id', bot_id).execute()
                     continue
                     
-                users_res = await supabase.table('bot_join_users').select('telegram_user_id').in_('link_id', link_ids).execute()
+                users_res = await supabase.table('tg_bot_join_users').select('telegram_user_id').in_('link_id', link_ids).execute()
                 target_users = getattr(users_res, 'data', []) or []
                 
                 if not target_users:
                     # Deep resilience: if still no users, maybe they are linked to bot_id directly
-                    await supabase.table('bot_broadcast_progress').update({'status': 'completed', 'error_log': 'No users'}).eq('task_id', task_id).eq('bot_id', bot_id).execute()
+                    await supabase.table('tg_bot_broadcast_progress').update({'status': 'completed', 'error_log': 'No users'}).eq('task_id', task_id).eq('bot_id', bot_id).execute()
                     continue
 
                 logger.info(f"Bot {bot_id}: Starting broadcast for task {task_id} to {len(target_users)} users.")
@@ -683,14 +683,14 @@ async def process_task(task):
                         except: pass
                     
                     duration = time.time() - start_time
-                    await supabase.table('bot_broadcast_progress').update({
+                    await supabase.table('tg_bot_broadcast_progress').update({
                         'status': 'completed', 'sent_count': stats['sent'],
                         'total_targeted': len(users),
                         'error_log': f"Finished in {duration:.2f}s with {stats['errors']} errors"
                     }).eq('task_id', t_id).eq('bot_id', b_id).execute()
                     
                     # Also mark the task as completed if this was the last bot or we want to clear it
-                    await supabase.table('broadcast_tasks').update({'status': 'completed'}).eq('id', t_id).execute()
+                    await supabase.table('tg_broadcast_tasks').update({'status': 'completed'}).eq('id', t_id).execute()
                     
                     logger.info(f"Bot {b_id}: Completed broadcast for task {t_id}. Sent: {stats['sent']}/{len(users)} in {duration:.2f}s")
 
@@ -703,11 +703,11 @@ async def synchronize_bots():
     try:
         logger.info("Synchronizing bots with database...")
         # 1. Fetch bots
-        response = await supabase.table('telegram_tracker').select('*').in_('status', ['Pending', 'Active', 'pending', 'active']).execute()
+        response = await supabase.table('tg_tracker').select('*').in_('status', ['Pending', 'Active', 'pending', 'active']).execute()
         bots = getattr(response, 'data', []) or []
         
         # 2. Fetch mappings
-        mapping_res = await supabase.table('bot_channel_mappings').select('*').eq('status', 'Active').execute()
+        mapping_res = await supabase.table('tg_bot_channel_mappings').select('*').eq('status', 'Active').execute()
         all_mappings = getattr(mapping_res, 'data', []) or []
         
         current_bot_ids = set()
@@ -737,7 +737,7 @@ async def synchronize_bots():
                 await asyncio.sleep(0.5)
 
         # 3. Check for any pending tasks that were missed
-        tasks_res = await supabase.table('broadcast_tasks').select('*').eq('status', 'pending').execute()
+        tasks_res = await supabase.table('tg_broadcast_tasks').select('*').eq('status', 'pending').execute()
         pending_tasks = getattr(tasks_res, 'data', []) or []
         for task in pending_tasks:
             await process_task(task)
@@ -791,9 +791,9 @@ async def bot_runner():
                 logger.info(f"Realtime Event: {event_type} on {table}")
                 
                 if MAIN_LOOP:
-                    if table == 'broadcast_tasks' and event_type.upper() == 'INSERT':
+                    if table == 'tg_broadcast_tasks' and event_type.upper() == 'INSERT':
                         asyncio.run_coroutine_threadsafe(process_task(record), MAIN_LOOP)
-                    elif table in ['telegram_tracker', 'bot_channel_mappings']:
+                    elif table in ['tg_tracker', 'tg_bot_channel_mappings']:
                         asyncio.run_coroutine_threadsafe(synchronize_bots(), MAIN_LOOP)
             except Exception as e:
                 logger.error(f"Error in on_realtime_event: {e}")
@@ -805,7 +805,7 @@ async def bot_runner():
         channel.on_postgres_changes(
             event="INSERT",
             schema="public",
-            table="broadcast_tasks",
+            table="tg_broadcast_tasks",
             callback=on_realtime_event
         )
         
@@ -813,7 +813,7 @@ async def bot_runner():
         channel.on_postgres_changes(
             event="*",
             schema="public",
-            table="telegram_tracker",
+            table="tg_tracker",
             callback=on_realtime_event
         )
         
@@ -821,7 +821,7 @@ async def bot_runner():
         channel.on_postgres_changes(
             event="*",
             schema="public",
-            table="bot_channel_mappings",
+            table="tg_bot_channel_mappings",
             callback=on_realtime_event
         )
         await channel.subscribe()

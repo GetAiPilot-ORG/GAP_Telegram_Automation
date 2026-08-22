@@ -70,7 +70,7 @@ COMMANDS: List[Tuple[str, str]] = [
     ("status", "Check login status"),
     ("login", "Login your Telegram account"),
     ("config", "View current mapping"),
-    ("plans", "View plans & features"),
+    ("tg_plans", "View plans & features"),
     ("upgrade", f"Buy/Renew Premium (₹{PLAN_PRICE_INR} / {PLAN_DURATION_DAYS} days)"),
     ("stoplogin", "Cancel an in-progress /login flow"),
     ("upgrade_status", "Check subscription status"),
@@ -127,7 +127,7 @@ def sp_add_blacklist_word(uid: int, word: str) -> Tuple[bool, str]:
     if not w:
         return False, "⚠️ Use: `/blacklist_word WORD`"
     try:
-        supabase.table("user_blacklist_words").insert({
+        supabase.table("tg_user_blacklist_words").insert({
             "user_id": uid,
             "word": w,
             "word_lower": w.lower(),
@@ -140,7 +140,7 @@ def sp_add_blacklist_word(uid: int, word: str) -> Tuple[bool, str]:
         return False, f"❌ Failed: {ex}"
 
 def sp_list_blacklist(uid: int) -> List[dict]:
-    res = supabase.table("user_blacklist_words").select("*")\
+    res = supabase.table("tg_user_blacklist_words").select("*")\
         .eq("user_id", uid).order("created_at", desc=True).execute()
     return res.data or []
 
@@ -148,9 +148,9 @@ def sp_delete_blacklist_word(uid: int, word: str) -> Tuple[bool, str]:
     w = (word or "").strip().lower()
     if not w:
         return False, "⚠️ Use: `/remove_blacklist` buttons se delete karo."
-    supabase.table("user_blacklist_words").delete()\
+    supabase.table("tg_user_blacklist_words").delete()\
         .eq("user_id", uid).eq("word_lower", w).execute()
-    check = supabase.table("user_blacklist_words").select("id")\
+    check = supabase.table("tg_user_blacklist_words").select("id")\
         .eq("user_id", uid).eq("word_lower", w).limit(1).execute()
     if check.data:
         return False, "❌ Remove failed (DB). Try again."
@@ -159,9 +159,9 @@ def sp_delete_blacklist_word(uid: int, word: str) -> Tuple[bool, str]:
 def sp_delete_blacklist_batch(uid: int, words: List[str]) -> int:
     lowers = [ (w or "").strip().lower() for w in words if (w or "").strip() ]
     if not lowers: return 0
-    supabase.table("user_blacklist_words").delete()\
+    supabase.table("tg_user_blacklist_words").delete()\
         .eq("user_id", uid).in_("word_lower", lowers).execute()
-    rem = supabase.table("user_blacklist_words").select("id")\
+    rem = supabase.table("tg_user_blacklist_words").select("id")\
         .eq("user_id", uid).in_("word_lower", lowers).execute().data or []
     return max(0, len(lowers) - len(rem))
 #10-11-2025
@@ -172,7 +172,7 @@ def sp_set_start_text(uid: int, text: str):
         "start_text": text.strip(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    supabase.table("user_text_addons").upsert(payload, on_conflict="user_id").execute()
+    supabase.table("tg_user_text_addons").upsert(payload, on_conflict="user_id").execute()
 
 def sp_set_end_text(uid: int, text: str):
     payload = {
@@ -180,13 +180,13 @@ def sp_set_end_text(uid: int, text: str):
         "end_text": text.strip(),
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    supabase.table("user_text_addons").upsert(payload, on_conflict="user_id").execute()
+    supabase.table("tg_user_text_addons").upsert(payload, on_conflict="user_id").execute()
 
 def sp_remove_texts(uid: int):
-    supabase.table("user_text_addons").delete().eq("user_id", uid).execute()
+    supabase.table("tg_user_text_addons").delete().eq("user_id", uid).execute()
 
 def sp_get_text_addons(uid: int) -> dict:
-    res = supabase.table("user_text_addons").select("*").eq("user_id", uid).limit(1).execute()
+    res = supabase.table("tg_user_text_addons").select("*").eq("user_id", uid).limit(1).execute()
     return res.data[0] if res.data else {"start_text": "", "end_text": ""}
 
 
@@ -202,7 +202,7 @@ def sp_add_filter(uid: int, from_name: str, to_name: str) -> Tuple[bool, str]:
 
     try:
         # ✅ Do NOT send generated columns in payload
-        supabase.table("user_text_filters").insert({
+        supabase.table("tg_user_text_filters").insert({
             "user_id": uid,
             "from_name": from_name,
             "to_name": to_name,
@@ -221,16 +221,16 @@ def sp_add_filter(uid: int, from_name: str, to_name: str) -> Tuple[bool, str]:
 
 
 def sp_list_filters(uid: int) -> List[dict]:
-    res = supabase.table("user_text_filters").select("*")\
+    res = supabase.table("tg_user_text_filters").select("*")\
         .eq("user_id", uid).order("created_at", desc=True).execute()
     return res.data or []
 
 def sp_delete_filter(uid: int, from_name: str) -> Tuple[bool, str]:
     from_name = from_name.strip()
     if not from_name: return False, "⚠️ Use: `/removefilter old` (ya `@old`)"
-    supabase.table("user_text_filters").delete()\
+    supabase.table("tg_user_text_filters").delete()\
         .eq("user_id", uid).eq("from_name_lower", from_name.lower()).execute()
-    check = supabase.table("user_text_filters").select("id").eq("user_id", uid)\
+    check = supabase.table("tg_user_text_filters").select("id").eq("user_id", uid)\
         .eq("from_name_lower", from_name.lower()).limit(1).execute()
     if check.data: return False, "❌ Could not remove (DB). Try again."
     return True, f"🗑️ Removed filter for `{from_name}`"
@@ -239,9 +239,9 @@ def sp_delete_filters_batch(uid: int, from_names: List[str]) -> int:
     if not from_names: return 0
     lowers = [fn.strip().lower() for fn in from_names if fn and fn.strip()]
     if not lowers: return 0
-    supabase.table("user_text_filters").delete().eq("user_id", uid)\
+    supabase.table("tg_user_text_filters").delete().eq("user_id", uid)\
         .in_("from_name_lower", lowers).execute()
-    rem = supabase.table("user_text_filters").select("id").eq("user_id", uid)\
+    rem = supabase.table("tg_user_text_filters").select("id").eq("user_id", uid)\
         .in_("from_name_lower", lowers).execute().data or []
     return max(0, len(lowers) - len(rem))
 
@@ -303,7 +303,7 @@ def apply_blacklist(text: str, compiled_blacklist: List[re.Pattern]) -> str:
 
 # ---------- Sessions / Mappings / Delay ----------
 def sp_get_session(uid: int) -> Optional[dict]:
-    res = supabase.table("user_sessions").select("*").eq("user_id", uid).limit(1).execute()
+    res = supabase.table("tg_user_sessions").select("*").eq("user_id", uid).limit(1).execute()
     return res.data[0] if res.data else None
 
 def sp_upsert_session(uid: int, phone: str, session_file: str):
@@ -312,16 +312,16 @@ def sp_upsert_session(uid: int, phone: str, session_file: str):
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
-        supabase.table("user_sessions").upsert(payload, on_conflict="user_id").execute()
+        supabase.table("tg_user_sessions").upsert(payload, on_conflict="user_id").execute()
     except Exception:
-        existing = supabase.table("user_sessions").select("user_id").eq("user_id", uid).limit(1).execute()
+        existing = supabase.table("tg_user_sessions").select("user_id").eq("user_id", uid).limit(1).execute()
         if existing and existing.data:
-            supabase.table("user_sessions").update(payload).eq("user_id", uid).execute()
+            supabase.table("tg_user_sessions").update(payload).eq("user_id", uid).execute()
         else:
-            supabase.table("user_sessions").insert(payload).execute()
+            supabase.table("tg_user_sessions").insert(payload).execute()
 
 def sp_delete_session(uid: int):
-    supabase.table("user_sessions").delete().eq("user_id", uid).execute()
+    supabase.table("tg_user_sessions").delete().eq("user_id", uid).execute()
 
 def sp_upsert_mapping(
     uid: int,
@@ -344,16 +344,16 @@ def sp_upsert_mapping(
         payload["receivers_names"] = receivers_names
 
     try:
-        supabase.table("forward_mappings").upsert(
+        supabase.table("tg_forward_mappings").upsert(
             payload, on_conflict="user_id,sender_id"
         ).execute()
     except Exception:
-        supabase.table("forward_mappings").delete()\
+        supabase.table("tg_forward_mappings").delete()\
             .eq("user_id", uid).eq("sender_id", sender_id).execute()
-        supabase.table("forward_mappings").insert(payload).execute()
+        supabase.table("tg_forward_mappings").insert(payload).execute()
 
 def sp_load_rows(uid: int) -> List[dict]:
-    return supabase.table("forward_mappings").select("*").eq("user_id", uid).execute().data or []
+    return supabase.table("tg_forward_mappings").select("*").eq("user_id", uid).execute().data or []
 
 def sp_load_mapping(uid: int) -> Dict[int, List[int]]:
     mp: Dict[int, List[int]] = {}
@@ -363,7 +363,7 @@ def sp_load_mapping(uid: int) -> Dict[int, List[int]]:
 
 def sp_delete_senders(uid: int, sender_ids: List[int]):
     for sid in sender_ids:
-        supabase.table("forward_mappings").delete().eq("user_id", uid).eq("sender_id", sid).execute()
+        supabase.table("tg_forward_mappings").delete().eq("user_id", uid).eq("sender_id", sid).execute()
 
 def sp_remove_targets_globally(uid: int, target_ids: List[int]):
     rows = sp_load_rows(uid)
@@ -397,14 +397,14 @@ def sp_remove_targets_globally(uid: int, target_ids: List[int]):
                     receivers_names=new_rec_names,
                 )
             else:
-                supabase.table("forward_mappings").delete()\
+                supabase.table("tg_forward_mappings").delete()\
                     .eq("user_id", uid).eq("sender_id", r["sender_id"]).execute()
 
 def sp_delete_all_filters(uid: int) -> int:
-    rows = supabase.table("user_text_filters").select("id").eq("user_id", uid).execute().data or []
+    rows = supabase.table("tg_user_text_filters").select("id").eq("user_id", uid).execute().data or []
     count = len(rows)
     if count:
-        supabase.table("user_text_filters").delete().eq("user_id", uid).execute()
+        supabase.table("tg_user_text_filters").delete().eq("user_id", uid).execute()
     return count
 
 def sp_set_delay(uid: int, seconds: int):
@@ -413,16 +413,16 @@ def sp_set_delay(uid: int, seconds: int):
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     try:
-        supabase.table("user_settings").upsert(payload, on_conflict="user_id").execute()
+        supabase.table("tg_user_settings").upsert(payload, on_conflict="user_id").execute()
     except Exception:
-        existing = supabase.table("user_settings").select("user_id").eq("user_id", uid).limit(1).execute()
+        existing = supabase.table("tg_user_settings").select("user_id").eq("user_id", uid).limit(1).execute()
         if existing and existing.data:
-            supabase.table("user_settings").update(payload).eq("user_id", uid).execute()
+            supabase.table("tg_user_settings").update(payload).eq("user_id", uid).execute()
         else:
-            supabase.table("user_settings").insert(payload).execute()
+            supabase.table("tg_user_settings").insert(payload).execute()
 
 def sp_get_delay(uid: int) -> Optional[int]:
-    res = supabase.table("user_settings").select("delay_seconds").eq("user_id", uid).limit(1).execute()
+    res = supabase.table("tg_user_settings").select("delay_seconds").eq("user_id", uid).limit(1).execute()
     data = res.data or []
     if not data: return None
     try: return int(data[0].get("delay_seconds") or 0)
@@ -434,7 +434,7 @@ def sp_get_forwarding_users() -> List[int]:
     Restart ke baad isi list se auto-resume karenge.
     """
     try:
-        res = supabase.table("user_settings").select("user_id", "is_forwarding")\
+        res = supabase.table("tg_user_settings").select("user_id", "is_forwarding")\
             .eq("is_forwarding", True).execute()
         rows = res.data or []
         uids: List[int] = []
@@ -793,7 +793,7 @@ PLAN_LEVEL = {
 
 # Sab free commands
 ALWAYS_ALLOWED = {
-    "start","start_demo","help","login","status","config","plans","upgrade",
+    "start","start_demo","help","login","status","config","tg_plans","upgrade",
     "upgrade_status","logout","stoplogin",
     "remove_incoming","remove_outgoing","removefilter","removedelay",
     "remove_text","remove_blacklist"
@@ -1691,7 +1691,7 @@ async def cmd_work(e):
         await _handle_forward_event(uid, evt)
 
     # Mark in DB that forwarding is active
-    supabase.table("user_settings").update({
+    supabase.table("tg_user_settings").update({
         "is_forwarding": True
     }).eq("user_id", uid).execute()
 
@@ -1910,7 +1910,7 @@ async def cmd_stop(e):
     USER_CLIENT_CACHE.pop(uid, None)
 
     # Mark forwarding as stopped
-    supabase.table("user_settings").update({
+    supabase.table("tg_user_settings").update({
         "is_forwarding": False
     }).eq("user_id", uid).execute()
 
@@ -2167,7 +2167,7 @@ async def remove_delay_cmd(e):
             "delay_seconds": 0,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        supabase.table("user_settings").upsert(payload, on_conflict="user_id").execute()
+        supabase.table("tg_user_settings").upsert(payload, on_conflict="user_id").execute()
 
         # If forwarding loop is active, update it immediately
         if uid in forward_loops:

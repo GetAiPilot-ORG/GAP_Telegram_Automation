@@ -33,7 +33,7 @@ async def main():
     # 1. Fetch bot token if not provided
     bot_token = TARGET_BOT_TOKEN
     if not bot_token:
-        bot_res = await supabase.table('telegram_tracker').select('bot_token').eq('id', TARGET_BOT_ID).execute()
+        bot_res = await supabase.table('tg_tracker').select('bot_token').eq('id', TARGET_BOT_ID).execute()
         if not bot_res.data:
             print("❌ Bot not found in DB! Check TARGET_BOT_ID.")
             return
@@ -41,7 +41,7 @@ async def main():
         print(f"✅ Bot token fetched from DB.")
 
     # 2. Fetch the user record
-    user_res = await supabase.table('bot_join_users')\
+    user_res = await supabase.table('tg_bot_join_users')\
         .select('*, link:bot_join_links(*)')\
         .eq('telegram_user_id', str(TARGET_USER_ID))\
         .eq('bot_id', TARGET_BOT_ID)\
@@ -66,7 +66,7 @@ async def main():
     # 3. Fetch invite link from channel mapping
     invite_link_str = "https://t.me/"
     if link_config.get('channel_mapping_id'):
-        m_res = await supabase.table('bot_channel_mappings')\
+        m_res = await supabase.table('tg_bot_channel_mappings')\
             .select('invite_link')\
             .eq('id', link_config['channel_mapping_id'])\
             .execute()
@@ -123,7 +123,7 @@ async def main():
 
         # 7. Update last_reminded_at
         now_iso = datetime.datetime.utcnow().isoformat()
-        await supabase.table('bot_join_users')\
+        await supabase.table('tg_bot_join_users')\
             .update({'last_reminded_at': now_iso, 'reminder_sent': True})\
             .eq('id', user_record['id'])\
             .execute()

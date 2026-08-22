@@ -132,7 +132,7 @@ async def get_community_by_chat_id(chat_id: int):
     if chat_id in COMMUNITY_CACHE:
         return COMMUNITY_CACHE[chat_id]
     community = sb_get_single(
-        "communities",
+        "tg_communities",
         "id,title,telegram_chat_id,invite_link,is_active,join_mode",
         [("telegram_chat_id", "eq", str(chat_id))],
     )
@@ -172,7 +172,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not subscription_id:
         for p in payloads_to_try:
             deeplink = sb_get_single(
-                "telegram_deeplinks",
+                "tg_deeplinks",
                 "id,token,subscription_id,used_at",
                 [("token", "eq", p)],
             )
@@ -189,7 +189,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3) Load subscription with embedded communities
     sub = sb_get_single(
-        "channel_subscriptions",
+        "tg_channel_subscriptions",
         "id,status,expires_at,community_id,landing_page_id,plan_id,"
         "communities(id,title,invite_link,is_active,join_mode,telegram_chat_id)",
         [("id", "eq", str(subscription_id))],
@@ -198,7 +198,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not sub:
         await msg.reply_text(
             "❌ Subscription not found.\n\n"
-            "Admin ko bolo: `channel_subscriptions` row + `telegram_deeplinks` row create ho rahi hai ya nahi."
+            "Admin ko bolo: `tg_channel_subscriptions` row + `tg_deeplinks` row create ho rahi hai ya nahi."
         )
         return
 
@@ -208,7 +208,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("❌ Subscription inactive/expired.")
         return
 
-    community = sub.get("communities")
+    community = sub.get("tg_communities")
     if isinstance(community, list):
         community = community[0] if community else None
 
@@ -217,7 +217,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cid = sub.get("community_id")
         if cid:
             community = sb_get_single(
-                "communities",
+                "tg_communities",
                 "id,title,telegram_chat_id,invite_link,is_active,join_mode",
                 [("id", "eq", str(cid))],
             )
@@ -237,7 +237,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 4) Map telegram_user_id in channel_subscriptions
     ok = sb_update(
-        "channel_subscriptions",
+        "tg_channel_subscriptions",
         {"telegram_user_id": tg_user_id},
         [("id", "eq", str(subscription_id))],
     )
@@ -247,7 +247,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 5) Mark deeplink used_at (one-time)
     if deeplink and deeplink.get("id"):
-        sb_update("telegram_deeplinks", {"used_at": now_iso()}, [("id", "eq", str(deeplink["id"]))])
+        sb_update("tg_deeplinks", {"used_at": now_iso()}, [("id", "eq", str(deeplink["id"]))])
 
     title = community.get("title") or "your channel"
     await msg.reply_text(
@@ -273,7 +273,7 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     rows = sb_get_many(
-        "channel_subscriptions",
+        "tg_channel_subscriptions",
         "id,expires_at,status",
         [
             ("telegram_user_id", "eq", str(tg_user_id)),
@@ -301,7 +301,7 @@ async def join_request_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 async def expiry_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         rows = sb_get_many(
-            "channel_subscriptions",
+            "tg_channel_subscriptions",
             "id,telegram_user_id,status,expires_at,community_id,communities(telegram_chat_id,title)",
             [("status", "eq", "active")],
         )
@@ -309,7 +309,7 @@ async def expiry_job(context: ContextTypes.DEFAULT_TYPE):
 
         for sub in rows:
             uid = sub.get("telegram_user_id")
-            community = sub.get("communities")
+            community = sub.get("tg_communities")
             if isinstance(community, list):
                 community = community[0] if community else None
             if not uid or not community:
@@ -329,7 +329,7 @@ async def expiry_job(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-            sb_update("channel_subscriptions", {"status": "expired"}, [("id", "eq", str(sub["id"]))])
+            sb_update("tg_channel_subscriptions", {"status": "expired"}, [("id", "eq", str(sub["id"]))])
 
     except Exception as e:
         log.error(f"expiry_job error: {e}")
