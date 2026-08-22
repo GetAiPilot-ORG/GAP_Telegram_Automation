@@ -2179,7 +2179,7 @@ async def remove_delay_cmd(e):
         await e.respond(f"❌ Failed to remove delay:\n`{ex}`", parse_mode="md")
 
 
-# --- /plans (public) — shows feature-only overview with plan buttons ---
+# --- /tg_plans(public) — shows feature-only overview with plan buttons ---
 @bot.on(events.NewMessage(pattern=r"^/plans$"))
 async def cmd_plans(e):
     uid = int(e.sender_id)

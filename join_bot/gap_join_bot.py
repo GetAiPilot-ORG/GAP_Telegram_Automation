@@ -108,7 +108,7 @@ async def start_bot(token: str, bot_id: str):
                 
                 # Removed the duplicate 'if not supabase: await event.respond...' block
                 # 1. Fetch the bot join link configuration with its mapping
-                link_res = await supabase.table('tg_bot_join_links').select('*, mapping:bot_channel_mappings(*)').eq('slug', payload).eq('bot_id', bot_id).execute()
+                link_res = await supabase.table('tg_bot_join_links').select('*, mapping:tg_bot_channel_mappings(*)').eq('slug', payload).eq('bot_id', bot_id).execute()
                 
                 if link_res.data:
                     link_config = link_res.data[0]
@@ -449,7 +449,7 @@ async def start_bot(token: str, bot_id: str):
                     # Fetch all candidates: status is bot_started or leaved
                     # Skip users who have blocked the bot (is_bot_blocked = true)
                     remind_res = await supabase.table('tg_bot_join_users')\
-                        .select('*, link:bot_join_links(*)')\
+                        .select('*, link:tg_bot_join_links(*)')\
                         .eq('bot_id', bot_id)\
                         .in_('status', ['bot_started', 'leaved'])\
                         .eq('is_bot_blocked', False)\

@@ -191,7 +191,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sub = sb_get_single(
         "tg_channel_subscriptions",
         "id,status,expires_at,community_id,landing_page_id,plan_id,"
-        "communities(id,title,invite_link,is_active,join_mode,telegram_chat_id)",
+        "tg_communities(id,title,invite_link,is_active,join_mode,telegram_chat_id)",
         [("id", "eq", str(subscription_id))],
     )
 
@@ -302,7 +302,7 @@ async def expiry_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         rows = sb_get_many(
             "tg_channel_subscriptions",
-            "id,telegram_user_id,status,expires_at,community_id,communities(telegram_chat_id,title)",
+            "id,telegram_user_id,status,expires_at,community_id,tg_communities(telegram_chat_id,title)",
             [("status", "eq", "active")],
         )
         now_utc = now_dt()

@@ -938,7 +938,7 @@ async def bot_runner():
             # 2. Join chatbot_configs with telegram_tracker to get the bot_token
             # Also fetch knowledge_base_text (n8n-generated full system prompt)
             query = supabase.table('tg_chatbot_configs')\
-                .select('*, telegram_tracker(bot_token)')\
+                .select('*, tg_tracker(bot_token)')\
                 .eq('status', 'active')
             
             response = await run_supabase_query(query)

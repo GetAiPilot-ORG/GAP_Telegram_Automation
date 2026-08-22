@@ -107,7 +107,7 @@ async def start_bot(token: str, bot_id: str):
                 
                 # Removed the duplicate 'if not supabase: await event.respond...' block
                 # 1. Fetch the bot join link configuration with its mapping
-                link_res = await supabase.table('tg_bot_join_links').select('*, mapping:bot_channel_mappings(*)').eq('slug', payload).eq('bot_id', bot_id).execute()
+                link_res = await supabase.table('tg_bot_join_links').select('*, mapping:tg_bot_channel_mappings(*)').eq('slug', payload).eq('bot_id', bot_id).execute()
                 
                 if link_res.data:
                     link_config = link_res.data[0]

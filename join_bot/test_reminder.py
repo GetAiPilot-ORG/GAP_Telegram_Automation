@@ -42,7 +42,7 @@ async def main():
 
     # 2. Fetch the user record
     user_res = await supabase.table('tg_bot_join_users')\
-        .select('*, link:bot_join_links(*)')\
+        .select('*, link:tg_bot_join_links(*)')\
         .eq('telegram_user_id', str(TARGET_USER_ID))\
         .eq('bot_id', TARGET_BOT_ID)\
         .execute()
