@@ -322,50 +322,56 @@ async def reminder_loop(bot: Bot):
 
 async def main():
     bot = Bot(BOT_TOKEN)
-
-    # Default admin rights: only "Add members" enabled
-    rights = ChatAdministratorRights(
-        is_anonymous=False,
-        can_manage_chat=False,
-        can_delete_messages=False,
-        can_manage_video_chats=False,
-        can_restrict_members=False,
-        can_promote_members=False,
-        can_change_info=False,
-        can_invite_users=True,   # ✅ "Add members" ON
-        can_post_stories=False,
-        can_edit_stories=False,
-        can_delete_stories=False,
-    )
-
-    # For groups / supergroups
-    await bot.set_my_default_administrator_rights(
-        rights=rights,
-        for_channels=False,
-    )
-
-    # For channels
-    await bot.set_my_default_administrator_rights(
-        rights=rights,
-        for_channels=True,
-    )
-
     dp = Dispatcher()
 
-    # Commands
-    dp.message.register(cmd_start, CommandStart())
-    dp.message.register(cmd_status, Command("status"))
+    try:
+        # Default admin rights: only "Add members" enabled
+        rights = ChatAdministratorRights(
+            is_anonymous=False,
+            can_manage_chat=False,
+            can_delete_messages=False,
+            can_manage_video_chats=False,
+            can_restrict_members=False,
+            can_promote_members=False,
+            can_change_info=False,
+            can_invite_users=True,   # ✅ "Add members" ON
+            can_post_stories=False,
+            can_edit_stories=False,
+            can_delete_stories=False,
+        )
 
-    # Join request
-    dp.chat_join_request.register(handle_join_request)
+        # For groups / supergroups
+        await bot.set_my_default_administrator_rights(
+            rights=rights,
+            for_channels=False,
+        )
 
-    print("🤖 Auto Approve Bot running (dashboard-managed subscriptions)...")
+        # For channels
+        await bot.set_my_default_administrator_rights(
+            rights=rights,
+            for_channels=True,
+        )
 
-    # Start expiry reminder background loop
-    asyncio.create_task(reminder_loop(bot))
+        # Commands
+        dp.message.register(cmd_start, CommandStart())
+        dp.message.register(cmd_status, Command("status"))
 
-    await dp.start_polling(bot)
+        # Join request
+        dp.chat_join_request.register(handle_join_request)
+
+        # Clear any existing webhook & drop pending updates to prevent conflicts
+        await bot.delete_webhook(drop_pending_updates=True)
+
+        print("🤖 Auto Approve Bot running (dashboard-managed subscriptions)...")
+
+        # Start expiry reminder background loop
+        asyncio.create_task(reminder_loop(bot))
+
+        await dp.start_polling(bot)
+    finally:
+        await bot.session.close()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
