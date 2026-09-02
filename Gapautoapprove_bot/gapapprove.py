@@ -195,7 +195,7 @@ async def handle_join_request(event: ChatJoinRequest, bot: Bot):
                 break
     except Exception as e:
         print(f"Error getting admins for chat {chat_id}: {e}")
-        return
+        # Continue to approve request even if admin lookup fails/times out
 
     # If owner doesn't have an active plan, send notification but still auto-approve
     if owner_id and not has_active_plan(owner_id):
@@ -325,32 +325,25 @@ async def main():
     dp = Dispatcher()
 
     try:
-        # Default admin rights: only "Add members" enabled
-        rights = ChatAdministratorRights(
-            is_anonymous=False,
-            can_manage_chat=False,
-            can_delete_messages=False,
-            can_manage_video_chats=False,
-            can_restrict_members=False,
-            can_promote_members=False,
-            can_change_info=False,
-            can_invite_users=True,   # ✅ "Add members" ON
-            can_post_stories=False,
-            can_edit_stories=False,
-            can_delete_stories=False,
-        )
-
-        # For groups / supergroups
-        await bot.set_my_default_administrator_rights(
-            rights=rights,
-            for_channels=False,
-        )
-
-        # For channels
-        await bot.set_my_default_administrator_rights(
-            rights=rights,
-            for_channels=True,
-        )
+        # Attempt to set default admin rights (non-fatal if restricted by Telegram)
+        try:
+            rights = ChatAdministratorRights(
+                is_anonymous=False,
+                can_manage_chat=False,
+                can_delete_messages=False,
+                can_manage_video_chats=False,
+                can_restrict_members=False,
+                can_promote_members=False,
+                can_change_info=False,
+                can_invite_users=True,   # ✅ "Add members" ON
+                can_post_stories=False,
+                can_edit_stories=False,
+                can_delete_stories=False,
+            )
+            await bot.set_my_default_administrator_rights(rights=rights, for_channels=False)
+            await bot.set_my_default_administrator_rights(rights=rights, for_channels=True)
+        except Exception as ex:
+            print(f"⚠️ Could not set default admin rights ({ex}), continuing startup...")
 
         # Commands
         dp.message.register(cmd_start, CommandStart())
