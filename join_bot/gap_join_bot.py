@@ -247,14 +247,16 @@ async def fetch_and_sync_channel_invites(client: TelegramClient, bot_id: str, ch
                 logger.error(f"Bot {bot_id}: Failed to save invite link {link_url}: {db_link_err}")
 
         # 4. Update mapping
-        if mapping_id and fetched_invites:
+        if mapping_id:
             try:
                 now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                await supabase.table('tg_bot_channel_mappings').update({
-                    'invite_link': fetched_invites[0]['link'],
+                upd_payload = {
                     'last_links_synced_at': now_iso,
                     'sync_links_requested': False
-                }).eq('id', mapping_id).execute()
+                }
+                if fetched_invites:
+                    upd_payload['invite_link'] = fetched_invites[0]['link']
+                await supabase.table('tg_bot_channel_mappings').update(upd_payload).eq('id', mapping_id).execute()
             except Exception as m_upd_err:
                 logger.error(f"Bot {bot_id}: Note updating mapping sync timestamp: {m_upd_err}")
 
@@ -486,24 +488,60 @@ async def start_bot(token: str, bot_id: str):
                     
                     try:
                         now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                        prev_res = await supabase.table('tg_bot_join_users').select('status, rejoin_count, left_channel').eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
+                        prev_res = await supabase.table('tg_bot_join_users').select('id, status, rejoin_count, left_channel, link_id').eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
                         prev_data = getattr(prev_res, 'data', []) or []
 
-                        update_data = {
-                            "joined_channel": True,
-                            "left_channel": False,
-                            "joined_at": now_iso,
-                            "status": "active",
-                            "last_reminded_at": None,
-                            "is_bot_blocked": False,
-                        }
+                        if prev_data:
+                            update_data = {
+                                "joined_channel": True,
+                                "left_channel": False,
+                                "joined_at": now_iso,
+                                "status": "active",
+                                "last_reminded_at": None,
+                                "is_bot_blocked": False,
+                            }
 
-                        if prev_data and (prev_data[0].get('status') == 'leaved' or prev_data[0].get('left_channel') is True):
-                            update_data["rejoined_at"] = now_iso
-                            update_data["rejoin_count"] = (prev_data[0].get('rejoin_count') or 0) + 1
-                            logger.info(f"Bot {bot_id}: User {user_tg_id} REJOINED. rejoin_count={update_data['rejoin_count']}")
+                            if prev_data[0].get('status') == 'leaved' or prev_data[0].get('left_channel') is True:
+                                update_data["rejoined_at"] = now_iso
+                                update_data["rejoin_count"] = (prev_data[0].get('rejoin_count') or 0) + 1
+                                logger.info(f"Bot {bot_id}: User {user_tg_id} REJOINED. rejoin_count={update_data['rejoin_count']}")
 
-                        await supabase.table('tg_bot_join_users').update(update_data).eq('bot_id', bot_id).eq('telegram_user_id', user_tg_id).execute()
+                            await supabase.table('tg_bot_join_users').update(update_data).eq('id', prev_data[0]['id']).execute()
+                        else:
+                            # Direct channel join without starting the bot first!
+                            target_mapping_id = None
+                            for m in mappings:
+                                if str(m.get('channel_id', '')) in chat_id_str or chat_id_str in str(m.get('channel_id', '')):
+                                    target_mapping_id = m.get('id')
+                                    break
+
+                            target_link_id = None
+                            if target_mapping_id:
+                                l_res = await supabase.table('tg_bot_join_links')\
+                                    .select('id')\
+                                    .eq('channel_mapping_id', target_mapping_id)\
+                                    .order('is_auto_fetched', desc=True)\
+                                    .limit(1)\
+                                    .execute()
+                                if l_res.data:
+                                    target_link_id = l_res.data[0]['id']
+
+                            bot_cfg = GLOBAL_BOT_CONFIGS.get(bot_id)
+                            u_id = bot_cfg.get('user_id') if bot_cfg else None
+
+                            if target_link_id and u_id:
+                                await supabase.table('tg_bot_join_users').insert({
+                                    "user_id": u_id,
+                                    "bot_id": bot_id,
+                                    "link_id": target_link_id,
+                                    "telegram_user_id": int(user_tg_id),
+                                    "telegram_first_name": getattr(user_event, 'first_name', '') or '',
+                                    "telegram_username": getattr(user_event, 'username', None),
+                                    "joined_channel": True,
+                                    "joined_at": now_iso,
+                                    "status": "active"
+                                }).execute()
+                                logger.info(f"Bot {bot_id}: Registered direct channel join for user {user_tg_id} on link {target_link_id}")
                     except Exception as log_err:
                         logger.error(f"Failed to update channel join stats: {log_err}")
 
@@ -529,13 +567,103 @@ async def start_bot(token: str, bot_id: str):
             except Exception as ev_err:
                 logger.error(f"Error in chat handler: {ev_err}")
 
-        # ---- Handle Raw Admin Updates for Channels ----
+        # ---- Handle Raw Participant & Admin Updates for Channels ----
         @client.on(events.Raw(UpdateChannelParticipant))
         @client.on(events.Raw(UpdateChatParticipantAdmin))
         @client.on(events.Raw(UpdateChatParticipant))
         async def raw_admin_update_handler(event):
             try:
                 channel_id = getattr(event, 'channel_id', None) or getattr(event, 'chat_id', None)
+                invite_obj = getattr(event, 'invite', None)
+                user_joined_id = getattr(event, 'user_id', None)
+                
+                # Auto-discover invite link created by other admins and track the join
+                if invite_obj and channel_id:
+                    link_url = getattr(invite_obj, 'link', None)
+                    link_title = getattr(invite_obj, 'title', None) or "Admin Invite Link"
+                    admin_id = getattr(invite_obj, 'admin_id', None)
+                    req_needed = getattr(invite_obj, 'request_needed', False)
+                    usage_lim = getattr(invite_obj, 'usage_limit', None)
+
+                    if link_url:
+                        cid_str = str(channel_id)
+                        full_cid_str = cid_str if cid_str.startswith("-100") else f"-100{cid_str}"
+                        logger.info(f"Bot {bot_id}: Discovered admin invite link from Admin ID {admin_id}: {link_url} ('{link_title}')")
+                        
+                        mappings = GLOBAL_CHANNEL_MAPPINGS.get(bot_id, [])
+                        m_id = None
+                        for m in mappings:
+                            if str(m.get('channel_id', '')) in full_cid_str or full_cid_str in str(m.get('channel_id', '')):
+                                m_id = m.get('id')
+                                break
+
+                        bot_cfg = GLOBAL_BOT_CONFIGS.get(bot_id)
+                        u_id = bot_cfg.get('user_id') if bot_cfg else None
+
+                        target_link_id = None
+                        try:
+                            # Extract clean prefix token to match existing links even if Telegram returns truncated "https://t.me/+RJ74MoBt..."
+                            clean_token = link_url.rstrip('.').replace('https://t.me/+', '').replace('https://t.me/joinchat/', '').replace('https://t.me/', '')
+                            
+                            all_links_res = await supabase.table('tg_bot_join_links').select('id, name, invite_link').eq('bot_id', bot_id).execute()
+                            all_links = getattr(all_links_res, 'data', []) or []
+                            
+                            # 1. Look for exact match or prefix token match
+                            for l in all_links:
+                                inv = l.get('invite_link') or ''
+                                if inv == link_url or (clean_token and len(clean_token) >= 5 and clean_token in inv):
+                                    target_link_id = l['id']
+                                    break
+                            
+                            if not target_link_id and u_id:
+                                slug = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+                                ins_res = await supabase.table('tg_bot_join_links').insert({
+                                    "user_id": u_id,
+                                    "bot_id": bot_id,
+                                    "channel_mapping_id": m_id,
+                                    "name": link_title,
+                                    "slug": slug,
+                                    "invite_link": link_url,
+                                    "is_auto_fetched": True,
+                                    "telegram_admin_id": str(admin_id) if admin_id else None,
+                                    "is_request_needed": bool(req_needed),
+                                    "usage_limit": usage_lim,
+                                    "telegram_message": "Click the button below to join the private channel.",
+                                    "button_text": "Join Channel"
+                                }).execute()
+                                if ins_res.data:
+                                    target_link_id = ins_res.data[0]['id']
+                                logger.info(f"Bot {bot_id}: Registered admin invite link: {link_url}")
+
+                            # Directly attribute the user join to THIS specific link!
+                            if user_joined_id and target_link_id and u_id:
+                                now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                                u_chk = await supabase.table('tg_bot_join_users').select('id, status, left_channel').eq('bot_id', bot_id).eq('telegram_user_id', user_joined_id).execute()
+                                if u_chk.data:
+                                    upd = {
+                                        "link_id": target_link_id,
+                                        "joined_channel": True,
+                                        "left_channel": False,
+                                        "joined_at": now_iso,
+                                        "status": "active"
+                                    }
+                                    if u_chk.data[0].get('status') == 'leaved' or u_chk.data[0].get('left_channel') is True:
+                                        upd["rejoined_at"] = now_iso
+                                    await supabase.table('tg_bot_join_users').update(upd).eq('id', u_chk.data[0]['id']).execute()
+                                else:
+                                    await supabase.table('tg_bot_join_users').insert({
+                                        "user_id": u_id,
+                                        "bot_id": bot_id,
+                                        "link_id": target_link_id,
+                                        "telegram_user_id": int(user_joined_id),
+                                        "joined_channel": True,
+                                        "joined_at": now_iso,
+                                        "status": "active"
+                                    }).execute()
+                                logger.info(f"Bot {bot_id}: Successfully tracked direct join for user {user_joined_id} on invite link (link_id: {target_link_id})")
+                        except Exception as ins_err:
+                            logger.error(f"Bot {bot_id}: Error registering admin invite link or user: {ins_err}")
+
                 if channel_id:
                     logger.info(f"Bot {bot_id}: Admin update detected on channel {channel_id}. Running auto-detection & link sync...")
                     cid_str = str(channel_id)
