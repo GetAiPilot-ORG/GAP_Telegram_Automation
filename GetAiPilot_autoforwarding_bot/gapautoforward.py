@@ -625,14 +625,20 @@ def sp_grant_demo(uid_tg: int) -> Tuple[bool, str]:
 def sp_link_telegram_to_app_user(user_uuid: str, telegram_user_id: int) -> bool:
     try:
         now = datetime.now(timezone.utc).isoformat()
+        telegram_id = int(telegram_user_id)
         supabase.table("app_user_subscriptions").upsert(
             {
                 "user_id": user_uuid,
-                "telegram_user_id": int(telegram_user_id),
+                "telegram_user_id": telegram_id,
                 "updated_at": now,
             },
             on_conflict="user_id"
         ).execute()
+        # Some dashboard screens still read profiles while others read the
+        # subscription row. Keep both projections synchronized.
+        supabase.table("profiles").update(
+            {"telegram_user_id": telegram_id}
+        ).eq("id", user_uuid).execute()
         return True
     except Exception as ex:
         print("sp_link_telegram_to_app_user error:", ex)

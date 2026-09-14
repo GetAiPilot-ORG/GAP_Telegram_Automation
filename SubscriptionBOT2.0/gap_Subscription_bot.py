@@ -16,6 +16,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL") or os.getenv("VITE_SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://getaipilot.in").rstrip("/")
 
 if not BOT_TOKEN or not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("Missing BOT_TOKEN / SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY")
@@ -373,8 +374,7 @@ async def expiry_job(context: ContextTypes.DEFAULT_TYPE):
                     try:
                         landing_page = sub.get("tg_landing_pages")
                         slug = landing_page.get("slug") if landing_page else None
-                        # Using localhost link for local testing!
-                        checkout_url = f"\n\nRenew here to get back in:\nhttp://localhost:8080/p/{slug}" if slug else ""
+                        checkout_url = f"\n\nRenew here to get back in:\n{FRONTEND_URL}/p/{slug}" if slug else ""
                         msg = f"❌ You have been removed from *{title}* because your subscription has expired.{checkout_url}"
                         await context.bot.send_message(chat_id=uid, text=msg, parse_mode="Markdown")
                     except Exception as e:
@@ -398,7 +398,7 @@ async def expiry_job(context: ContextTypes.DEFAULT_TYPE):
                     landing_page = sub.get("tg_landing_pages")
                     slug = landing_page.get("slug") if landing_page else None
                     if slug:
-                        checkout_url = f"http://localhost:8080/p/{slug}"
+                        checkout_url = f"{FRONTEND_URL}/p/{slug}"
                         days_left = max(1, int(time_left / 86400))
                         
                         msg = (
@@ -505,7 +505,7 @@ async def renew_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         slug = lp.get("slug") if lp else None
         
         if slug:
-            checkout_url = f"http://localhost:8080/p/{slug}"
+            checkout_url = f"{FRONTEND_URL}/p/{slug}"
             
             if exp_dt > now_utc:
                 days = max(0, (exp_dt - now_utc).days)
@@ -524,6 +524,12 @@ async def renew_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------------- MAIN ----------------
 def main():
+    import asyncio
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)

@@ -117,4 +117,3 @@ pm2 logs 5
 
 # To list all running services
 pm2 status
-```
