@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import httpx
 from dotenv import load_dotenv
 from supabase import create_async_client, AsyncClient
 from telethon import TelegramClient, events, Button
@@ -219,25 +220,170 @@ async def main():
             return
 
         try:
-            owner_data = await get_owner_data(sender_id)
+            channel_id = state.get('channel_id')
+            channel_name = state.get('channel_name') or "Channel"
             orig_msg = state.get('original_msg')
+            media_path = state.get('media_path')
+            raw_text = orig_msg.message if orig_msg else ""
+            owner_data = await get_owner_data(sender_id)
+            user_id = owner_data.get('id') if owner_data else None
+
+            # 1. Update UI to indicate sending
+            await event.edit(f"⏳ **Broadcasting message to {channel_name}...**")
+
+            # 2. Record task in Supabase
             task_data = {
-                'user_id': owner_data.get('id'),
-                'channel_id': state.get('channel_id'),
+                'user_id': user_id,
+                'channel_id': channel_id,
                 'message_data': {
                     'text': orig_msg.text if orig_msg else "",
                     'has_media': bool(orig_msg.media) if orig_msg else False,
-                    'raw_text': orig_msg.message if orig_msg else "",
-                    'media_path': state.get('media_path')
+                    'raw_text': raw_text,
+                    'media_path': media_path
                 },
-                'status': 'pending'
+                'status': 'processing'
             }
-            await supabase.table('tg_broadcast_tasks').insert(task_data).execute()
-            await event.edit("✅ **Broadcast task created!**")
+            task_id = None
+            try:
+                task_res = await supabase.table('tg_broadcast_tasks').insert(task_data).execute()
+                if task_res.data:
+                    task_id = task_res.data[0]['id']
+            except Exception as e:
+                logger.warning(f"Error inserting task into DB: {e}")
+
+            # 3. Post to Channel
+            clean_cid = str(channel_id).replace("-100", "").replace("-", "")
+            target_peer = int(f"-100{clean_cid}")
+            
+            channel_sent = False
+            channel_error = None
+
+            # Attempt A: Send directly via @Gapgrowbot (Telethon client)
+            try:
+                if media_path and os.path.exists(media_path):
+                    await client.send_message(target_peer, raw_text, file=media_path)
+                else:
+                    await client.send_message(target_peer, raw_text)
+                channel_sent = True
+                logger.info(f"Broadcast posted to {channel_name} via Gapgrowbot")
+            except Exception as e:
+                channel_error = str(e)
+                logger.warning(f"Gapgrowbot could not post to {channel_name}: {e}")
+
+            # Attempt B: Fallback via channel's mapped bot in tg_tracker
+            if not channel_sent:
+                try:
+                    m_res = await supabase.table('tg_bot_channel_mappings').select('bot_id').eq('channel_id', str(channel_id)).execute()
+                    mappings = getattr(m_res, 'data', []) or []
+                    for m in mappings:
+                        b_res = await supabase.table('tg_tracker').select('bot_token').eq('id', m['bot_id']).execute()
+                        bots = getattr(b_res, 'data', []) or []
+                        if bots and bots[0].get('bot_token'):
+                            sub_token = bots[0]['bot_token']
+                            async with httpx.AsyncClient(timeout=15.0) as http:
+                                if media_path and os.path.exists(media_path):
+                                    with open(media_path, "rb") as f:
+                                        resp = await http.post(
+                                            f"https://api.telegram.org/bot{sub_token}/sendDocument",
+                                            data={"chat_id": target_peer, "caption": raw_text},
+                                            files={"document": f}
+                                        )
+                                        if resp.status_code == 200 and resp.json().get("ok"):
+                                            channel_sent = True
+                                            channel_error = None
+                                            break
+                                else:
+                                    resp = await http.post(
+                                        f"https://api.telegram.org/bot{sub_token}/sendMessage",
+                                        json={"chat_id": target_peer, "text": raw_text}
+                                    )
+                                    if resp.status_code == 200 and resp.json().get("ok"):
+                                        channel_sent = True
+                                        channel_error = None
+                                        break
+                except Exception as ex:
+                    logger.warning(f"Fallback bot failed: {ex}")
+
+            # 4. Also send DMs to tracked audience members who joined via bot invite links
+            users_sent = 0
+            users_total = 0
+            try:
+                m_res = await supabase.table('tg_bot_channel_mappings').select('id, bot_id').eq('channel_id', str(channel_id)).execute()
+                mappings = getattr(m_res, 'data', []) or []
+                for m in mappings:
+                    l_res = await supabase.table('tg_bot_join_links').select('id').eq('channel_mapping_id', m['id']).execute()
+                    link_ids = [l['id'] for l in getattr(l_res, 'data', [])]
+                    if not link_ids:
+                        l_res = await supabase.table('tg_bot_join_links').select('id').eq('bot_id', m['bot_id']).execute()
+                        link_ids = [l['id'] for l in getattr(l_res, 'data', [])]
+                    
+                    if link_ids:
+                        u_res = await supabase.table('tg_bot_join_users').select('telegram_user_id').in_('link_id', link_ids).execute()
+                        users = getattr(u_res, 'data', []) or []
+                        users_total += len(users)
+                        
+                        b_res = await supabase.table('tg_tracker').select('bot_token').eq('id', m['bot_id']).execute()
+                        b_data = getattr(b_res, 'data', []) or []
+                        if b_data and b_data[0].get('bot_token'):
+                            sub_token = b_data[0]['bot_token']
+                            async with httpx.AsyncClient(timeout=10.0) as http:
+                                for u in users:
+                                    uid = u.get('telegram_user_id')
+                                    if not uid: continue
+                                    try:
+                                        r = await http.post(
+                                            f"https://api.telegram.org/bot{sub_token}/sendMessage",
+                                            json={"chat_id": int(uid), "text": raw_text}
+                                        )
+                                        if r.status_code == 200 and r.json().get("ok"):
+                                            users_sent += 1
+                                        await asyncio.sleep(0.05)
+                                    except Exception:
+                                        pass
+            except Exception as ex:
+                logger.error(f"Error sending to audience: {ex}")
+
+            # 5. Clean up temporary media
+            if media_path and os.path.exists(media_path):
+                try:
+                    os.remove(media_path)
+                except Exception:
+                    pass
+
+            # 6. Update task in Supabase
+            if task_id:
+                final_status = 'completed' if (channel_sent or users_sent > 0) else 'failed'
+                await supabase.table('tg_broadcast_tasks').update({'status': final_status}).eq('id', task_id).execute()
+
+            # 7. Provide complete, helpful response to the user
+            if channel_sent:
+                success_msg = f"✅ **Broadcast successfully sent!**\n\n📢 **Channel:** {channel_name}"
+                if users_total > 0:
+                    success_msg += f"\n👥 **Audience Delivered:** {users_sent}/{users_total} members"
+                await event.edit(success_msg)
+            elif users_sent > 0:
+                await event.edit(
+                    f"✅ **Broadcast delivered to audience!**\n\n"
+                    f"👥 **Audience Delivered:** {users_sent}/{users_total} members\n\n"
+                    f"⚠️ **Channel Note:** Could not post directly to **{channel_name}** because @Gapgrowbot is not an admin in the channel with 'Post Messages' permission."
+                )
+            else:
+                await event.edit(
+                    f"❌ **Broadcast delivery failed for {channel_name}.**\n\n"
+                    f"👉 **How to fix:**\n"
+                    f"1. Open channel **{channel_name}** in Telegram\n"
+                    f"2. Go to **Channel Settings > Administrators > Add Administrator**\n"
+                    f"3. Search for **@Gapgrowbot**\n"
+                    f"4. Give it **Post Messages** permission and Save!\n\n"
+                    f"Then use /send again to broadcast."
+                )
+
             user_states.pop(sender_id, None)
+
         except Exception as e:
-            logger.error(f"Confirm error: {e}")
-            await event.edit("❌ Failed to create task.")
+            logger.error(f"Confirm error: {e}", exc_info=True)
+            await event.edit(f"❌ Failed to process broadcast: {str(e)}")
+            user_states.pop(sender_id, None)
 
     @client.on(events.CallbackQuery(data='cancel_broadcast'))
     async def cancel_handler(event):
