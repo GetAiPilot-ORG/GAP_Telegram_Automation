@@ -169,14 +169,41 @@ async def fetch_and_sync_channel_invites(client: TelegramClient, bot_id: str, ch
             try:
                 async with session.get(f"https://api.telegram.org/bot{token}/getChat?chat_id={full_channel_id}") as resp:
                     chat_data = await resp.json()
-                    if chat_data.get('ok') and chat_data.get('result', {}).get('invite_link'):
-                        p_link = chat_data['result']['invite_link']
-                        seen_links.add(p_link)
-                        fetched_invites.append({
-                            'link': p_link,
-                            'title': "Primary Channel Link",
-                            'request_needed': False
-                        })
+                    if chat_data.get('ok') and chat_data.get('result'):
+                        chat_result = chat_data['result']
+                        
+                        # Auto-create mapping if it doesn't exist
+                        if not mapping_id:
+                            try:
+                                channel_title = chat_result.get('title', f"Channel {full_channel_id}")
+                                channel_username = chat_result.get('username')
+                                icon_url = await fetch_channel_photo_b64(token, full_channel_id)
+                                
+                                m_payload = {
+                                    "user_id": user_id,
+                                    "bot_id": bot_id,
+                                    "channel_id": str(full_channel_id),
+                                    "channel_name": channel_title,
+                                    "channel_username": channel_username,
+                                    "channel_icon_url": icon_url,
+                                    "status": "Active",
+                                    "invite_link": chat_result.get('invite_link')
+                                }
+                                ins_map = await supabase.table('tg_bot_channel_mappings').insert(m_payload).execute()
+                                if ins_map.data:
+                                    mapping_id = ins_map.data[0]['id']
+                                    logger.info(f"Bot {bot_id}: Auto-created channel mapping {mapping_id} for '{channel_title}'")
+                            except Exception as map_err:
+                                logger.error(f"Bot {bot_id}: Failed to auto-create channel mapping: {map_err}")
+
+                        if chat_result.get('invite_link'):
+                            p_link = chat_result['invite_link']
+                            seen_links.add(p_link)
+                            fetched_invites.append({
+                                'link': p_link,
+                                'title': "Primary Channel Link",
+                                'request_needed': False
+                            })
             except Exception as e_gc:
                 logger.warning(f"Bot {bot_id}: getChat invite link note: {e_gc}")
 
