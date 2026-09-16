@@ -737,11 +737,22 @@ async def start_bot(token: str, bot_id: str):
                                         upd["rejoined_at"] = now_iso
                                     await supabase.table('tg_bot_join_users').update(upd).eq('id', u_chk.data[0]['id']).execute()
                                 else:
+                                    first_name = ""
+                                    username = None
+                                    try:
+                                        user_ent = await client.get_entity(int(user_joined_id))
+                                        first_name = getattr(user_ent, 'first_name', '') or ''
+                                        username = getattr(user_ent, 'username', None)
+                                    except Exception:
+                                        pass
+
                                     await supabase.table('tg_bot_join_users').insert({
                                         "user_id": u_id,
                                         "bot_id": bot_id,
                                         "link_id": target_link_id,
                                         "telegram_user_id": int(user_joined_id),
+                                        "telegram_first_name": first_name,
+                                        "telegram_username": username,
                                         "joined_channel": True,
                                         "joined_at": now_iso,
                                         "status": "active"
