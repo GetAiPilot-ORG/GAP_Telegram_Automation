@@ -250,6 +250,10 @@ async def fetch_and_sync_channel_invites(client: TelegramClient, bot_id: str, ch
                             .eq('is_request_needed', inv.get('request_needed', False))\
                             .execute()
                         existing_by_map = getattr(map_check, 'data', []) or []
+                    else:
+                        # Without a mapping_id we cannot safely deduplicate — skip to prevent orphan links
+                        logger.warning(f"Bot {bot_id}: Skipping auto-link insert for '{inv['title']}' — no mapping_id found (would create orphan link).")
+                        continue
 
                     if existing_by_map and len(existing_by_map) > 0:
                         await supabase.table('tg_bot_join_links').update({
