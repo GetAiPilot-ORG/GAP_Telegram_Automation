@@ -143,10 +143,13 @@ async def fetch_and_sync_channel_invites(client: TelegramClient, bot_id: str, ch
         if not user_id or not mapping_id:
             m_res = await supabase.table('tg_bot_channel_mappings').select('*').eq('bot_id', bot_id).execute()
             m_data = getattr(m_res, 'data', []) or []
+            clean_cid = cid_str.replace("-100", "").strip()
             for m in m_data:
                 m_cid_str = str(m.get('channel_id', ''))
-                if m_cid_str in cid_str or cid_str in m_cid_str:
+                m_clean = m_cid_str.replace("-100", "").strip()
+                if m_clean == clean_cid or m_cid_str in cid_str or cid_str in m_cid_str:
                     mapping_id = m.get('id')
+                    user_id = user_id or m.get('user_id')
                     break
 
         token = None
@@ -207,40 +210,21 @@ async def fetch_and_sync_channel_invites(client: TelegramClient, bot_id: str, ch
             except Exception as e_gc:
                 logger.warning(f"Bot {bot_id}: getChat invite link note: {e_gc}")
 
-            # 2. Get or Create dedicated Request-to-Join Link
-            existing_rtj = None
+            # 2. Sync already known tracked links for this channel (do not auto-create unwanted links)
             if mapping_id:
-                db_res = await supabase.table('tg_bot_join_links').select('*').eq('channel_mapping_id', mapping_id).eq('is_request_needed', True).execute()
-                if db_res.data:
-                    existing_rtj = db_res.data[0].get('invite_link')
-                    if existing_rtj and existing_rtj not in seen_links:
-                        seen_links.add(existing_rtj)
-                        fetched_invites.append({
-                            'link': existing_rtj,
-                            'title': db_res.data[0].get('name') or "Auto Join Request Link",
-                            'request_needed': True
-                        })
-
-            if not existing_rtj:
                 try:
-                    payload = {
-                        "chat_id": full_channel_id,
-                        "name": "Auto Join Request Link",
-                        "creates_join_request": True
-                    }
-                    async with session.post(f"https://api.telegram.org/bot{token}/createChatInviteLink", json=payload) as resp:
-                        c_data = await resp.json()
-                        if c_data.get('ok') and c_data.get('result', {}).get('invite_link'):
-                            rtj_link = c_data['result']['invite_link']
-                            if rtj_link not in seen_links:
-                                seen_links.add(rtj_link)
-                                fetched_invites.append({
-                                    'link': rtj_link,
-                                    'title': "Auto Join Request Link",
-                                    'request_needed': True
-                                })
-                except Exception as e_cr:
-                    logger.warning(f"Bot {bot_id}: createChatInviteLink note: {e_cr}")
+                    db_res = await supabase.table('tg_bot_join_links').select('*').eq('channel_mapping_id', mapping_id).execute()
+                    for existing_item in (getattr(db_res, 'data', []) or []):
+                        ex_link = existing_item.get('invite_link')
+                        if ex_link and ex_link not in seen_links:
+                            seen_links.add(ex_link)
+                            fetched_invites.append({
+                                'link': ex_link,
+                                'title': existing_item.get('name') or "Channel Invite Link",
+                                'request_needed': bool(existing_item.get('is_request_needed', False))
+                            })
+                except Exception as e_fetch_known:
+                    logger.warning(f"Bot {bot_id}: note fetching existing mapped links: {e_fetch_known}")
 
         logger.info(f"Bot {bot_id}: Found {len(fetched_invites)} invite link(s) to sync for channel {full_channel_id}.")
 
@@ -307,10 +291,6 @@ async def fetch_and_sync_channel_invites(client: TelegramClient, bot_id: str, ch
                 logger.error(f"Bot {bot_id}: Note updating mapping sync timestamp: {m_upd_err}")
 
         return fetched_invites
-
-    except Exception as top_err:
-        logger.error(f"Bot {bot_id}: Error in fetch_and_sync_channel_invites: {top_err}")
-        return []
 
     except Exception as top_err:
         logger.error(f"Bot {bot_id}: Error in fetch_and_sync_channel_invites: {top_err}")

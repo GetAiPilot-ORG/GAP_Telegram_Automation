@@ -53,39 +53,17 @@ async def sync_all_active_mappings():
             except Exception as e_gc:
                 print("getChat note:", e_gc)
                 
-            # 2. RTJ link
-            existing_rtj = None
-            db_res = await client.table('tg_bot_join_links').select('*').eq('channel_mapping_id', mapping_id).eq('is_request_needed', True).execute()
-            if db_res.data:
-                existing_rtj = db_res.data[0].get('invite_link')
-                if existing_rtj and existing_rtj not in seen_links:
-                    seen_links.add(existing_rtj)
+            # 2. Keep known tracked links for this channel
+            db_res = await client.table('tg_bot_join_links').select('*').eq('channel_mapping_id', mapping_id).execute()
+            for existing_item in (getattr(db_res, 'data', []) or []):
+                ex_link = existing_item.get('invite_link')
+                if ex_link and ex_link not in seen_links:
+                    seen_links.add(ex_link)
                     fetched_invites.append({
-                        'link': existing_rtj,
-                        'title': db_res.data[0].get('name') or "Auto Join Request Link",
-                        'request_needed': True
+                        'link': ex_link,
+                        'title': existing_item.get('name') or "Channel Invite Link",
+                        'request_needed': bool(existing_item.get('is_request_needed', False))
                     })
-                    
-            if not existing_rtj:
-                try:
-                    payload = {
-                        "chat_id": full_cid,
-                        "name": "Auto Join Request Link",
-                        "creates_join_request": True
-                    }
-                    async with session.post(f"https://api.telegram.org/bot{bot_token}/createChatInviteLink", json=payload) as resp:
-                        c_data = await resp.json()
-                        if c_data.get('ok') and c_data.get('result', {}).get('invite_link'):
-                            rtj_link = c_data['result']['invite_link']
-                            if rtj_link not in seen_links:
-                                seen_links.add(rtj_link)
-                                fetched_invites.append({
-                                    'link': rtj_link,
-                                    'title': "Auto Join Request Link",
-                                    'request_needed': True
-                                })
-                except Exception as e_cr:
-                    print("createChatInviteLink note:", e_cr)
                     
             for inv in fetched_invites:
                 link_url = inv['link']
