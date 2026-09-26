@@ -1950,6 +1950,20 @@ async def _handle_forward_event(uid: int, evt):
             # per-target chhota sa throttle
             await asyncio.sleep(FORWARD_THROTTLE)
 
+        # --- OPTIONAL PRIVATE BROADCAST RELAY INTEGRATION ---
+        # If PRIVATE_BROADCAST_RELAY_CHAT_ID is set, relay a copy of the source post to the private broadcast relay
+        relay_chat_id_env = os.getenv("PRIVATE_BROADCAST_RELAY_CHAT_ID") or os.getenv("GAP_PRIVATE_BROADCAST_RELAY_CHAT_ID")
+        if relay_chat_id_env:
+            try:
+                relay_chat_id = int(relay_chat_id_env.strip())
+                if relay_chat_id not in targets:
+                    if has_media:
+                        await uclient.send_file(relay_chat_id, file=msg.media, caption=text or "")
+                    elif text:
+                        await uclient.send_message(relay_chat_id, text)
+            except Exception as relay_ex:
+                print(f"⚠️ [AUTOFORWARD-RELAY-ERR] Failed to copy message to relay channel: {relay_ex}")
+
     except Exception as ex:
         print("forward handler err:", ex)
     
