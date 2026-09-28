@@ -9,11 +9,21 @@ from database.repository import Repository
 from config import BATCH_SIZE, DELAY_BETWEEN_MESSAGES, logger
 
 class BroadcastWorker:
-    def __init__(self, client: TelegramClient, repo: Repository):
-        self.client = client
+    def __init__(self, client: TelegramClient, repo: Repository, clients_map: Optional[Dict[str, TelegramClient]] = None):
+        self.default_client = client
+        self.clients_map = clients_map or {}
         self.repo = repo
         self._is_running = False
         self._wake_event = asyncio.Event()
+
+    def register_client(self, bot_id: str, client: TelegramClient):
+        if bot_id:
+            self.clients_map[bot_id] = client
+
+    def get_client_for_job(self, bot_id: Optional[str] = None) -> TelegramClient:
+        if bot_id and bot_id in self.clients_map:
+            return self.clients_map[bot_id]
+        return self.default_client
 
     def wake(self):
         """Signal worker to check for pending jobs immediately."""
@@ -132,7 +142,8 @@ class BroadcastWorker:
                     target_user_id=target_user_id,
                     source_chat_id=source_chat_id,
                     source_message_ids=source_message_ids,
-                    message_type=message_type
+                    message_type=message_type,
+                    bot_id=job.get("bot_id")
                 )
 
                 if success:
@@ -176,27 +187,30 @@ class BroadcastWorker:
         target_user_id: int,
         source_chat_id: int,
         source_message_ids: List[int],
-        message_type: str
+        message_type: str,
+        bot_id: Optional[str] = None
     ) -> tuple[bool, str, Optional[str]]:
         """
         Send/copy message to target Telegram user.
         Handles rate limits (FloodWait) and permanent errors (Bot Blocked).
+        Resolves correct bot client instance for multi-tenant bots.
         """
         max_retries = 3
         retry_count = 0
+        client = self.get_client_for_job(bot_id)
 
         while retry_count < max_retries:
             try:
                 # Forward message with author attribution preserved (drop_author=False)
                 if len(source_message_ids) == 1:
-                    await self.client.forward_messages(
+                    await client.forward_messages(
                         entity=target_chat_id,
                         messages=source_message_ids[0],
                         from_peer=source_chat_id,
                         drop_author=False
                     )
                 else:
-                    await self.client.forward_messages(
+                    await client.forward_messages(
                         entity=target_chat_id,
                         messages=source_message_ids,
                         from_peer=source_chat_id,

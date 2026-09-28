@@ -23,6 +23,78 @@ class Repository:
             logger.error(f"[PRIVATE-BROADCAST] Error fetching active bots: {ex}")
             return []
 
+    async def get_owner_aliases(self, owner_id: Any) -> set:
+        """
+        Resolve all ID aliases (Supabase Auth UUID, Telegram User ID, mapped Channel IDs)
+        for a given user/owner to guarantee 100% accurate subscriber routing across all bots and channels.
+        """
+        if not owner_id or owner_id == "default":
+            return set()
+
+        owner_str = str(owner_id).strip()
+        aliases = {owner_str}
+
+        # Calculate numeric ID variations (-100 prefix, positive, short)
+        if owner_str.lstrip("-").isdigit():
+            abs_s = owner_str.lstrip("-")
+            short_s = abs_s[3:] if abs_s.startswith("100") else abs_s
+            aliases.add(abs_s)
+            aliases.add(short_s)
+            aliases.add(f"-100{short_s}")
+
+        try:
+            # 1. Lookup in profiles table
+            res_prof = await self.supabase.table("profiles")\
+                .select("id, telegram_user_id")\
+                .or_(f"id.eq.{owner_str},telegram_user_id.eq.{owner_str}")\
+                .execute()
+            for p in (getattr(res_prof, "data", []) or []):
+                if p.get("id"):
+                    aliases.add(str(p["id"]))
+                if p.get("telegram_user_id"):
+                    aliases.add(str(p["telegram_user_id"]))
+
+            # 2. Lookup in app_user_subscriptions table
+            res_sub = await self.supabase.table("app_user_subscriptions")\
+                .select("user_id, telegram_user_id")\
+                .or_(f"user_id.eq.{owner_str},telegram_user_id.eq.{owner_str}")\
+                .execute()
+            for s in (getattr(res_sub, "data", []) or []):
+                if s.get("user_id"):
+                    aliases.add(str(s["user_id"]))
+                if s.get("telegram_user_id"):
+                    aliases.add(str(s["telegram_user_id"]))
+
+            # 3. Lookup mapped channels in tg_forward_mappings for all gathered user_ids
+            current_uids = list(aliases)
+            for uid in current_uids:
+                if not uid.lstrip("-").isdigit():
+                    res_map = await self.supabase.table("tg_forward_mappings")\
+                        .select("sender_id, user_id")\
+                        .eq("user_id", uid)\
+                        .execute()
+                else:
+                    res_map = await self.supabase.table("tg_forward_mappings")\
+                        .select("sender_id, user_id")\
+                        .or_(f"user_id.eq.{uid},sender_id.eq.{uid}")\
+                        .execute()
+                for m in (getattr(res_map, "data", []) or []):
+                    sid = str(m.get("sender_id") or "")
+                    uid_val = str(m.get("user_id") or "")
+                    if sid:
+                        aliases.add(sid)
+                        s_abs = sid.lstrip("-")
+                        s_short = s_abs[3:] if s_abs.startswith("100") else s_abs
+                        aliases.add(s_abs)
+                        aliases.add(s_short)
+                        aliases.add(f"-100{s_short}")
+                    if uid_val:
+                        aliases.add(uid_val)
+        except Exception as ex:
+            logger.warning(f"[PRIVATE-BROADCAST] Error resolving owner aliases for {owner_id}: {ex}")
+
+        return aliases
+
     # ---------------- AUTOFORWARD MAPPINGS INTEGRATION ----------------
     async def get_autoforward_source_ids(self) -> List[int]:
         """
@@ -219,41 +291,18 @@ class Repository:
                 except ValueError:
                     pass
 
-            # Filter candidate rows matching owner_id or any mapped channel ID for this creator
+            # Filter candidate rows matching owner_id or any mapped channel/user alias for this creator
             if owner_id:
-                owner_str = str(owner_id)
-                abs_s = owner_str.lstrip("-")
-                short_s = abs_s[3:] if abs_s.startswith("100") else abs_s
-
-                mapped_channel_tags = {
-                    f"[owner:{owner_str}]",
-                    f"[owner:{abs_s}]",
-                    f"[owner:{short_s}]",
-                    f"[owner:-100{short_s}]"
-                }
-
-                # Dynamically include all channel IDs mapped to this user in tg_forward_mappings
-                try:
-                    mappings_res = await self.supabase.table("tg_forward_mappings").select("sender_id").eq("user_id", owner_str).execute()
-                    m_data = getattr(mappings_res, "data", []) or []
-                    for m in m_data:
-                        sid = str(m.get("sender_id") or "")
-                        if sid:
-                            mapped_channel_tags.add(f"[owner:{sid}]")
-                            s_abs = sid.lstrip("-")
-                            s_short = s_abs[3:] if s_abs.startswith("100") else s_abs
-                            mapped_channel_tags.add(f"[owner:{s_abs}]")
-                            mapped_channel_tags.add(f"[owner:{s_short}]")
-                            mapped_channel_tags.add(f"[owner:-100{s_short}]")
-                except Exception:
-                    pass
+                aliases = await self.get_owner_aliases(owner_id)
+                mapped_channel_tags = {f"[owner:{a}]" for a in aliases if a}
 
                 filtered = []
                 for r in rows:
                     l_name = r.get("last_name") or ""
                     u_id = r.get("user_id")
                     matches_tag = any(t in l_name for t in mapped_channel_tags)
-                    if matches_tag or str(u_id) == owner_str or str(u_id) == abs_s:
+                    matches_uid = u_id is not None and str(u_id) in aliases
+                    if matches_tag or matches_uid:
                         filtered.append(r)
 
                 if not filtered and rows:

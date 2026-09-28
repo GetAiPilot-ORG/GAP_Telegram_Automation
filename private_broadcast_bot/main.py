@@ -80,13 +80,17 @@ async def main():
             bot = TelegramClient(session_path, API_ID, API_HASH)
             await bot.start(bot_token=b_info["token"])
             me = await bot.get_me()
-            logger.info(f"[PRIVATE-BROADCAST] Bot started: @{me.username} (ID: {me.id}) | Owner: {b_info.get('owner_id') or 'default'}")
+            owner_label = f"User ({b_info['owner_id']})" if b_info.get("owner_id") else "Shared Multi-Tenant System (All Users & Channels)"
+            logger.info(f"[PRIVATE-BROADCAST] Bot started: @{me.username} (ID: {me.id}) | Mode: {owner_label}")
 
             if not worker:
                 worker = BroadcastWorker(bot, repo)
                 broadcast_service = BroadcastService(repo, worker_trigger_callback=worker.wake)
             else:
                 broadcast_service = BroadcastService(repo, worker_trigger_callback=worker.wake)
+
+            if b_info.get("bot_id"):
+                worker.register_client(str(b_info["bot_id"]), bot)
 
             register_user_handlers(
                 bot,

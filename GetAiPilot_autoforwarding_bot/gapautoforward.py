@@ -1788,7 +1788,10 @@ async def _handle_forward_event(uid: int, evt):
         if not state:
             return
 
-        uclient: TelegramClient = state["client"]
+        uclient: TelegramClient = state.get("client")
+        if not uclient:
+            print(f"⚠️ [FORWARD-WARN] uclient is None for user {uid}")
+            return
         mapping: Dict[int, List[int]] = state["mapping"]
         compiled_now = state.get("filters", [])
         curr_blacklist = state.get("blacklist", [])
@@ -1921,8 +1924,9 @@ async def _handle_forward_event(uid: int, evt):
                     elif msg.sticker:
                         await uclient.send_file(int(t), msg.sticker, caption=text or "")
 
-                    elif msg.animation:
-                        await uclient.send_file(int(t), msg.animation, caption=text or "")
+                    elif getattr(msg, "gif", None) or getattr(msg, "animation", None):
+                        anim = getattr(msg, "gif", None) or getattr(msg, "animation", None)
+                        await uclient.send_file(int(t), anim, caption=text or "")
 
                     elif msg.video_note:
                         await uclient.send_file(int(t), msg.video_note, caption=text or "")
@@ -1964,6 +1968,8 @@ async def _handle_forward_event(uid: int, evt):
             except Exception as relay_ex:
                 print(f"⚠️ [AUTOFORWARD-RELAY-ERR] Failed to copy message to relay channel: {relay_ex}")
 
+    except errors.common.TypeNotFoundError as typ_ex:
+        print(f"⚠️ [TL-TYPE-ERR] Telegram server returned unrecognized TL Object ID: {typ_ex}")
     except Exception as ex:
         print("forward handler err:", ex)
     
@@ -2506,7 +2512,10 @@ async def resume_forwarding_on_start():
                 async def respond(self, *args, **kwargs):
                     # /work normally e.respond(...) use karta hai,
                     # hum usko bridge kar rahe hain bot.send_message se.
-                    await bot.send_message(self.sender_id, *args, **kwargs)
+                    try:
+                        await bot.send_message(self.sender_id, *args, **kwargs)
+                    except Exception as ex:
+                        print(f"⚠️ FakeEvent respond warning for {self.sender_id}: {ex}")
 
             await cmd_work(FakeEvent())
 
