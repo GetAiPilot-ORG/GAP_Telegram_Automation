@@ -31,67 +31,89 @@ class Repository:
         if not owner_id or owner_id == "default":
             return set()
 
-        owner_str = str(owner_id).strip()
-        aliases = {owner_str}
+        raw_str = str(owner_id).strip()
+        parts = [p.strip() for p in raw_str.replace(",", " ").split() if p.strip()]
 
-        # Calculate numeric ID variations (-100 prefix, positive, short)
-        if owner_str.lstrip("-").isdigit():
-            abs_s = owner_str.lstrip("-")
-            short_s = abs_s[3:] if abs_s.startswith("100") else abs_s
-            aliases.add(abs_s)
-            aliases.add(short_s)
-            aliases.add(f"-100{short_s}")
+        aliases = set()
+        for p in parts:
+            aliases.add(p)
+            if p.lstrip("-").isdigit():
+                abs_s = p.lstrip("-")
+                short_s = abs_s[3:] if abs_s.startswith("100") else abs_s
+                aliases.add(abs_s)
+                aliases.add(short_s)
+                aliases.add(f"-100{short_s}")
 
+        # 1. Lookup in profiles table
         try:
-            # 1. Lookup in profiles table
-            res_prof = await self.supabase.table("profiles")\
-                .select("id, telegram_user_id")\
-                .or_(f"id.eq.{owner_str},telegram_user_id.eq.{owner_str}")\
-                .execute()
-            for p in (getattr(res_prof, "data", []) or []):
-                if p.get("id"):
-                    aliases.add(str(p["id"]))
-                if p.get("telegram_user_id"):
-                    aliases.add(str(p["telegram_user_id"]))
+            for item in list(aliases):
+                is_uuid = len(item) == 36 and item.count("-") == 4
+                is_num = item.lstrip("-").isdigit()
+                res_prof = None
+                if is_uuid:
+                    res_prof = await self.supabase.table("profiles").select("id, telegram_user_id").eq("id", item).execute()
+                elif is_num:
+                    res_prof = await self.supabase.table("profiles").select("id, telegram_user_id").eq("telegram_user_id", item).execute()
 
-            # 2. Lookup in app_user_subscriptions table
-            res_sub = await self.supabase.table("app_user_subscriptions")\
-                .select("user_id, telegram_user_id")\
-                .or_(f"user_id.eq.{owner_str},telegram_user_id.eq.{owner_str}")\
-                .execute()
-            for s in (getattr(res_sub, "data", []) or []):
-                if s.get("user_id"):
-                    aliases.add(str(s["user_id"]))
-                if s.get("telegram_user_id"):
-                    aliases.add(str(s["telegram_user_id"]))
+                if res_prof:
+                    for p in (getattr(res_prof, "data", []) or []):
+                        if p.get("id"):
+                            aliases.add(str(p["id"]))
+                        if p.get("telegram_user_id"):
+                            aliases.add(str(p["telegram_user_id"]))
+        except Exception as ex:
+            logger.debug(f"[PRIVATE-BROADCAST] Profiles lookup skipped: {ex}")
 
-            # 3. Lookup mapped channels in tg_forward_mappings for all gathered user_ids
+        # 2. Lookup in app_user_subscriptions table
+        try:
+            for item in list(aliases):
+                is_uuid = len(item) == 36 and item.count("-") == 4
+                is_num = item.lstrip("-").isdigit()
+                res_sub = None
+                if is_uuid:
+                    res_sub = await self.supabase.table("app_user_subscriptions").select("user_id, telegram_user_id").eq("user_id", item).execute()
+                elif is_num:
+                    res_sub = await self.supabase.table("app_user_subscriptions").select("user_id, telegram_user_id").eq("telegram_user_id", item).execute()
+
+                if res_sub:
+                    for s in (getattr(res_sub, "data", []) or []):
+                        if s.get("user_id"):
+                            aliases.add(str(s["user_id"]))
+                        if s.get("telegram_user_id"):
+                            aliases.add(str(s["telegram_user_id"]))
+        except Exception as ex:
+            logger.debug(f"[PRIVATE-BROADCAST] Subscriptions lookup skipped: {ex}")
+
+        # 3. Lookup mapped channels in tg_forward_mappings for all gathered user_ids / channel_ids
+        try:
             current_uids = list(aliases)
             for uid in current_uids:
-                if not uid.lstrip("-").isdigit():
-                    res_map = await self.supabase.table("tg_forward_mappings")\
-                        .select("sender_id, user_id")\
-                        .eq("user_id", uid)\
-                        .execute()
-                else:
-                    res_map = await self.supabase.table("tg_forward_mappings")\
-                        .select("sender_id, user_id")\
-                        .or_(f"user_id.eq.{uid},sender_id.eq.{uid}")\
-                        .execute()
-                for m in (getattr(res_map, "data", []) or []):
-                    sid = str(m.get("sender_id") or "")
-                    uid_val = str(m.get("user_id") or "")
-                    if sid:
-                        aliases.add(sid)
-                        s_abs = sid.lstrip("-")
-                        s_short = s_abs[3:] if s_abs.startswith("100") else s_abs
-                        aliases.add(s_abs)
-                        aliases.add(s_short)
-                        aliases.add(f"-100{s_short}")
-                    if uid_val:
-                        aliases.add(uid_val)
+                uid_is_uuid = len(uid) == 36 and uid.count("-") == 4
+                uid_is_num = uid.lstrip("-").isdigit()
+
+                if uid_is_num:
+                    try:
+                        uid_int = int(uid)
+                        res_map1 = await self.supabase.table("tg_forward_mappings").select("sender_id, user_id").eq("sender_id", uid_int).execute()
+                        res_map2 = await self.supabase.table("tg_forward_mappings").select("sender_id, user_id").eq("user_id", uid_int).execute()
+                        data1 = getattr(res_map1, "data", []) or []
+                        data2 = getattr(res_map2, "data", []) or []
+                        for m in (data1 + data2):
+                            sid = str(m.get("sender_id") or "")
+                            uid_val = str(m.get("user_id") or "")
+                            if sid:
+                                aliases.add(sid)
+                                s_abs = sid.lstrip("-")
+                                s_short = s_abs[3:] if s_abs.startswith("100") else s_abs
+                                aliases.add(s_abs)
+                                aliases.add(s_short)
+                                aliases.add(f"-100{s_short}")
+                            if uid_val:
+                                aliases.add(uid_val)
+                    except Exception as inner_ex:
+                        logger.debug(f"[PRIVATE-BROADCAST] Mapping lookup for {uid} error: {inner_ex}")
         except Exception as ex:
-            logger.warning(f"[PRIVATE-BROADCAST] Error resolving owner aliases for {owner_id}: {ex}")
+            logger.debug(f"[PRIVATE-BROADCAST] tg_forward_mappings lookup skipped: {ex}")
 
         return aliases
 
@@ -99,36 +121,40 @@ class Repository:
     async def get_autoforward_source_ids(self) -> List[int]:
         """
         Fetch incoming source chat/channel IDs configured in tg_forward_mappings
-        ONLY where outgoing receiver is set to Private Broadcast ('Private_Broadcast').
+        OR registered in active telegram_private_broadcast_users owner tags.
         """
+        source_ids = set()
         try:
-            res = await self.supabase.table("tg_forward_mappings").select("*").execute()
+            # 1. Fetch from tg_forward_mappings
+            res = await self.supabase.table("tg_forward_mappings").select("sender_id").execute()
             data = getattr(res, "data", []) or []
-            source_ids = []
             for item in data:
-                receivers_names = item.get("receivers_names") or []
-                is_pb_target = False
-                if isinstance(receivers_names, list):
-                    for name in receivers_names:
-                        n_lower = str(name).lower()
-                        if "private_broadcast" in n_lower or "private broadcast" in n_lower or "gapgrowbot" in n_lower:
-                            is_pb_target = True
-                            break
-                elif isinstance(receivers_names, str):
-                    if "private_broadcast" in receivers_names.lower():
-                        is_pb_target = True
+                sid = item.get("sender_id")
+                if sid is not None:
+                    try:
+                        source_ids.add(int(sid))
+                    except ValueError:
+                        pass
 
-                if is_pb_target:
-                    sid = item.get("sender_id")
-                    if sid is not None:
-                        try:
-                            source_ids.append(int(sid))
-                        except ValueError:
-                            pass
-            return source_ids
+            # 2. Fetch from active subscriber owner tags
+            res_u = await self.supabase.table("telegram_private_broadcast_users").select("last_name").eq("is_active", True).execute()
+            u_data = getattr(res_u, "data", []) or []
+            for u in u_data:
+                l_name = u.get("last_name") or ""
+                if "[owner:" in l_name:
+                    for part in l_name.split("[owner:"):
+                        if "]" in part:
+                            tag_val = part.split("]")[0].strip()
+                            if tag_val.lstrip("-").isdigit():
+                                try:
+                                    source_ids.add(int(tag_val))
+                                except ValueError:
+                                    pass
+
+            return list(source_ids)
         except Exception as ex:
-            logger.warning(f"[PRIVATE-BROADCAST] Could not fetch AutoForward mappings: {ex}")
-            return []
+            logger.warning(f"[PRIVATE-BROADCAST] Could not fetch AutoForward source IDs: {ex}")
+            return list(source_ids)
 
     async def get_autoforward_mapping_for_source(self, source_chat_id: int) -> Optional[Dict[str, Any]]:
         """
@@ -264,7 +290,6 @@ class Repository:
         """
         Fetch active subscribers.
         If owner_id or bot_id is provided, filters ONLY subscribers belonging to that owner/bot.
-        Excludes the channel owner/sender (exclude_user_id) so creators do not receive their own broadcasts.
         Guarantees 100% multi-tenant channel & subscriber isolation.
         """
         try:
@@ -277,19 +302,6 @@ class Repository:
 
             res = await query.execute()
             rows = getattr(res, "data", []) or []
-
-            # Exclude IDs (owner or sender)
-            exclude_ids = set()
-            if exclude_user_id is not None:
-                try:
-                    exclude_ids.add(int(exclude_user_id))
-                except ValueError:
-                    pass
-            if owner_id is not None:
-                try:
-                    exclude_ids.add(int(owner_id))
-                except ValueError:
-                    pass
 
             # Filter candidate rows matching owner_id or any mapped channel/user alias for this creator
             if owner_id:
@@ -311,7 +323,7 @@ class Repository:
                         filtered = unassigned
                 rows = filtered
 
-            # Exclude owner / sender from recipients & deduplicate unique telegram_user_id
+            # Deduplicate unique telegram_user_id
             seen_uids = set()
             final_subscribers = []
             for r in rows:
@@ -319,7 +331,7 @@ class Repository:
                 if t_id is not None:
                     try:
                         t_id_int = int(t_id)
-                        if t_id_int in exclude_ids or t_id_int in seen_uids:
+                        if t_id_int in seen_uids:
                             continue
                         seen_uids.add(t_id_int)
                         final_subscribers.append(r)
@@ -341,11 +353,13 @@ class Repository:
             rows = getattr(res_all, "data", []) or []
 
             if owner_id:
-                owner_str = str(owner_id)
-                tag = f"[owner:{owner_str}]"
-                matched_rows = [r for r in rows if tag in (r.get("last_name") or "") or str(r.get("user_id")) == owner_str]
-                if matched_rows:
-                    rows = matched_rows
+                aliases = await self.get_owner_aliases(owner_id)
+                mapped_channel_tags = {f"[owner:{a}]" for a in aliases if a}
+                rows = [
+                    r for r in rows 
+                    if any(t in (r.get("last_name") or "") for t in mapped_channel_tags) 
+                    or (r.get("user_id") is not None and str(r.get("user_id")) in aliases)
+                ]
 
             total = len(rows)
             active = sum(1 for r in rows if r.get("is_active"))
@@ -561,4 +575,59 @@ class Repository:
         except Exception as ex:
             logger.error(f"[PRIVATE-BROADCAST] Error updating delivery {delivery_id}: {ex}")
             return False
+
+    async def get_custom_welcome_message(self, owner_id: Optional[Any] = None, bot_id: Optional[str] = None) -> Optional[str]:
+        """
+        Fetch welcome message configured in telegram_private_broadcast_bots.
+        """
+        try:
+            if bot_id and bot_id != "default":
+                res = await self.supabase.table("telegram_private_broadcast_bots").select("welcome_message").eq("id", bot_id).limit(1).execute()
+                data = getattr(res, "data", []) or []
+                if data and data[0].get("welcome_message"):
+                    return data[0]["welcome_message"]
+
+            if owner_id:
+                aliases = await self.get_owner_aliases(owner_id)
+                for a in aliases:
+                    if len(a) == 36 and a.count("-") == 4:
+                        res = await self.supabase.table("telegram_private_broadcast_bots").select("welcome_message").eq("user_id", a).limit(1).execute()
+                        data = getattr(res, "data", []) or []
+                        if data and data[0].get("welcome_message"):
+                            return data[0]["welcome_message"]
+
+            res_def = await self.supabase.table("telegram_private_broadcast_bots").select("welcome_message").eq("is_active", True).limit(1).execute()
+            data_def = getattr(res_def, "data", []) or []
+            if data_def and data_def[0].get("welcome_message"):
+                return data_def[0]["welcome_message"]
+
+            return None
+        except Exception as ex:
+            logger.debug(f"[PRIVATE-BROADCAST] Could not fetch custom welcome message: {ex}")
+            return None
+
+    async def get_custom_goodbye_message(self, owner_id: Optional[Any] = None, bot_id: Optional[str] = None) -> Optional[str]:
+        """
+        Fetch goodbye/opt-out message configured in telegram_private_broadcast_bots.
+        """
+        try:
+            if bot_id and bot_id != "default":
+                res = await self.supabase.table("telegram_private_broadcast_bots").select("goodbye_message").eq("id", bot_id).limit(1).execute()
+                data = getattr(res, "data", []) or []
+                if data and data[0].get("goodbye_message"):
+                    return data[0]["goodbye_message"]
+
+            if owner_id:
+                aliases = await self.get_owner_aliases(owner_id)
+                for a in aliases:
+                    if len(a) == 36 and a.count("-") == 4:
+                        res = await self.supabase.table("telegram_private_broadcast_bots").select("goodbye_message").eq("user_id", a).limit(1).execute()
+                        data = getattr(res, "data", []) or []
+                        if data and data[0].get("goodbye_message"):
+                            return data[0]["goodbye_message"]
+
+            return None
+        except Exception as ex:
+            logger.debug(f"[PRIVATE-BROADCAST] Could not fetch custom goodbye message: {ex}")
+            return None
 

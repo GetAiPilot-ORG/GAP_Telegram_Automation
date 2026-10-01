@@ -23,8 +23,15 @@ def register_user_handlers(
                 owner_id = param[6:]
             elif param.startswith("channel_"):
                 owner_id = param[8:]
+            elif param.startswith("c_"):
+                owner_id = param[2:]
             else:
                 owner_id = param
+
+        if owner_id:
+            s_owner = str(owner_id).strip()
+            if s_owner.isdigit() and len(s_owner) >= 10 and s_owner.startswith("100"):
+                owner_id = f"-{s_owner}"
 
         user = await evt.get_sender()
         response_text = await subscriber_service.register_subscriber(
@@ -43,6 +50,10 @@ def register_user_handlers(
         if not evt.is_private:
             return
 
-        response_text = await subscriber_service.opt_out_subscriber(evt.sender_id)
+        response_text = await subscriber_service.opt_out_subscriber(
+            telegram_user_id=evt.sender_id,
+            owner_id=default_owner_id,
+            bot_id=bot_id
+        )
         await evt.respond(response_text)
 

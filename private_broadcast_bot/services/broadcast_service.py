@@ -40,12 +40,12 @@ class BroadcastService:
     async def is_authorized_relay_async(self, chat_id: int, sender_id: Optional[int] = None) -> bool:
         """
         Async check authorizing relay source against RELAY_CHAT_IDS, ADMIN_IDS,
-        AND AutoForward mappings in tg_forward_mappings database table!
+        AutoForward mappings in tg_forward_mappings, AND private DMs from creators/admins.
         """
         if self.is_authorized_relay(chat_id, sender_id):
             return True
 
-        # Auto-authorize if chat matches an incoming source mapped in AutoForward
+        # 1. Auto-authorize if chat matches an incoming channel source
         af_ids = await self.repo.get_autoforward_source_ids()
         if af_ids:
             abs_chat_str = str(abs(chat_id))
@@ -57,6 +57,15 @@ class BroadcastService:
 
                 if chat_id == af_id or short_chat_str == short_af_str:
                     return True
+
+        # 2. Auto-authorize private DM broadcasts from creators/admins who have mapped channels or subscribers
+        if sender_id is not None:
+            aliases = await self.repo.get_owner_aliases(sender_id)
+            if len(aliases) > 1:
+                return True
+            subs = await self.repo.get_active_subscribers(owner_id=sender_id)
+            if subs:
+                return True
 
         return False
 
@@ -71,9 +80,14 @@ class BroadcastService:
             logger.warning(f"[PRIVATE-BROADCAST] Ignored message from unauthorized chat_id: {chat_id}, sender_id: {sender_id}")
             return None
 
-        # Fetch mapping to resolve owner_id
+        # Fetch mapping to resolve owner_id (combining channel ID and channel owner ID)
         mapping = await self.repo.get_autoforward_mapping_for_source(chat_id)
-        owner_id = mapping.get("user_id") if mapping else sender_id
+        if mapping and mapping.get("user_id"):
+            owner_id = f"{chat_id},{mapping.get('user_id')}"
+        elif sender_id and sender_id != chat_id:
+            owner_id = f"{chat_id},{sender_id}"
+        else:
+            owner_id = str(chat_id)
 
         grouped_id = getattr(message, "grouped_id", None)
         msg_id = message.id

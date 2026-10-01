@@ -3,7 +3,7 @@ from services.broadcast_service import BroadcastService
 from config import logger
 
 def register_relay_handlers(bot, broadcast_service: BroadcastService):
-    @bot.on(events.NewMessage(incoming=True))
+    @bot.on(events.NewMessage())
     async def handle_incoming_relay(evt):
         # Ignore outgoing messages sent by the bot itself
         if evt.out:
@@ -24,7 +24,10 @@ def register_relay_handlers(bot, broadcast_service: BroadcastService):
         chat_id = evt.chat_id
         sender_id = evt.sender_id
 
+        logger.info(f"[PRIVATE-BROADCAST] Channel/Relay message detected: chat_id={chat_id}, sender_id={sender_id}")
+
         if not await broadcast_service.is_authorized_relay_async(chat_id, sender_id):
+            logger.info(f"[PRIVATE-BROADCAST] Unauthorized source ignored: chat_id={chat_id}, sender_id={sender_id}")
             return
 
         # Process authorized relay message

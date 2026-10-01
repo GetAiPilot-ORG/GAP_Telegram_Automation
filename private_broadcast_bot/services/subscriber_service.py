@@ -30,18 +30,20 @@ class SubscriberService:
         )
         if success:
             logger.info(f"[PRIVATE-BROADCAST] Subscriber registered: {telegram_user_id} (@{username or 'no_username'}) | Owner: {owner_id or 'default'}")
-            return WELCOME_MESSAGE
+            custom_msg = await self.repo.get_custom_welcome_message(owner_id=owner_id, bot_id=bot_id)
+            return custom_msg or WELCOME_MESSAGE
         else:
             return "⚠️ An error occurred while processing your subscription. Please try again later."
 
-    async def opt_out_subscriber(self, telegram_user_id: int) -> str:
+    async def opt_out_subscriber(self, telegram_user_id: int, owner_id: Optional[Any] = None, bot_id: Optional[str] = None) -> str:
         """
         Deactivate subscriber upon /stop.
         """
         success = await self.repo.deactivate_subscriber(telegram_user_id)
         if success:
             logger.info(f"[PRIVATE-BROADCAST] Subscriber opted out: {telegram_user_id}")
-            return "⏸️ **You have been unsubscribed.**\n\nYou will no longer receive broadcast messages. Send **/start** anytime to reactivate your subscription."
+            custom_goodbye = await self.repo.get_custom_goodbye_message(owner_id=owner_id, bot_id=bot_id)
+            return custom_goodbye or "⏸️ **You have been unsubscribed.**\n\nYou will no longer receive broadcast messages. Send **/start** anytime to reactivate your subscription."
         else:
             return "⚠️ An error occurred while processing your request."
 

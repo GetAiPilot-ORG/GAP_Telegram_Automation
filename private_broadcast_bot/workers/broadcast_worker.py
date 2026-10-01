@@ -95,8 +95,13 @@ class BroadcastWorker:
         # 2. Get active subscribers & create delivery records if not already created
         owner_id = job.get("user_id")
         err_msg = job.get("error_message") or ""
-        if not owner_id and err_msg.startswith("[owner:") and err_msg.endswith("]"):
-            owner_id = err_msg[7:-1]
+        if not owner_id and "[owner:" in err_msg:
+            try:
+                owner_id = err_msg.split("[owner:")[1].split("]")[0]
+            except Exception:
+                pass
+        if not owner_id and source_chat_id:
+            owner_id = str(source_chat_id)
 
         subscribers = await self.repo.get_active_subscribers(
             owner_id=owner_id,
@@ -240,26 +245,22 @@ class BroadcastWorker:
                 
                 # Fallback send logic if forward_messages failed due to content restrictions
                 try:
-                    msgs = await self.client.get_messages(source_chat_id, ids=source_message_ids)
-                    source_title = None
-                    try:
-                        src_entity = await self.client.get_entity(source_chat_id)
-                        source_title = getattr(src_entity, 'title', None) or getattr(src_entity, 'first_name', None)
-                    except Exception:
-                        pass
-
+                    msgs = await client.get_messages(source_chat_id, ids=source_message_ids)
+                    # Resolve dynamic channel source title (e.g. 'test mb')
+                    source_title = await self._resolve_source_channel_name(client, source_chat_id)
                     header_prefix = f"📢 **From {source_title}:**\n\n" if source_title else ""
 
                     if msgs:
-                        for m in (msgs if isinstance(msgs, list) else [msgs]):
+                        msg_list = msgs if isinstance(msgs, list) else [msgs]
+                        for m in msg_list:
                             if not m:
                                 continue
                             text_content = m.message or ""
                             full_text = f"{header_prefix}{text_content}" if header_prefix else text_content
                             if m.media and not isinstance(m.media, MessageMediaWebPage):
-                                await self.client.send_file(target_chat_id, file=m.media, caption=full_text)
+                                await client.send_file(target_chat_id, file=m.media, caption=full_text)
                             elif full_text:
-                                await self.client.send_message(target_chat_id, full_text)
+                                await client.send_message(target_chat_id, full_text)
                         return True, "SUCCESS_FALLBACK", None
                 except Exception as fb_err:
                     logger.error(f"[PRIVATE-BROADCAST] Fallback send failed for user {target_user_id}: {fb_err}")
@@ -271,3 +272,61 @@ class BroadcastWorker:
                     return False, "FAILED", str(ex)
 
         return False, "FAILED", "Max retries exceeded"
+
+    async def _resolve_source_channel_name(self, client: TelegramClient, source_chat_id: int) -> Optional[str]:
+        """
+        Dynamically resolve the source Channel Title (e.g. 'test mb') for message headers.
+        Guarantees that user personal names (like 'Shwet') are never displayed.
+        """
+        try:
+            # 1. Check tg_forward_mappings database table for mapped source_name or sender_name
+            res = await self.repo.supabase.table("tg_forward_mappings").select("*").execute()
+            data = getattr(res, "data", []) or []
+
+            abs_chat_str = str(abs(source_chat_id))
+            short_chat_str = abs_chat_str[3:] if abs_chat_str.startswith("100") else abs_chat_str
+
+            for item in data:
+                sid = item.get("sender_id")
+                uid = item.get("user_id")
+                
+                matched = False
+                if sid is not None and str(sid).lstrip("-").isdigit():
+                    abs_s = str(abs(int(sid)))
+                    short_s = abs_s[3:] if abs_s.startswith("100") else abs_s
+                    if source_chat_id == int(sid) or short_chat_str == short_s:
+                        matched = True
+                if not matched and uid is not None and str(uid) == str(source_chat_id):
+                    matched = True
+
+                if matched:
+                    src_name = item.get("source_name") or item.get("sender_name") or item.get("channel_name")
+                    if src_name:
+                        return str(src_name).strip()
+
+            # 2. Query Telethon entity for channel title
+            try:
+                src_entity = await client.get_entity(source_chat_id)
+                ch_title = getattr(src_entity, "title", None)
+                if ch_title:
+                    return str(ch_title).strip()
+            except Exception:
+                pass
+
+            # 3. Query Telethon entity for mapped channel IDs from get_owner_aliases
+            aliases = await self.repo.get_owner_aliases(source_chat_id)
+            for a in aliases:
+                if a.lstrip("-").isdigit() and (a.startswith("-100") or a.startswith("100")):
+                    try:
+                        c_id = int(a) if a.startswith("-") else int(f"-100{a[3:] if a.startswith('100') else a}")
+                        c_ent = await client.get_entity(c_id)
+                        c_title = getattr(c_ent, "title", None)
+                        if c_title:
+                            return str(c_title).strip()
+                    except Exception:
+                        pass
+
+            return None
+        except Exception as ex:
+            logger.debug(f"[PRIVATE-BROADCAST] Could not resolve source channel name: {ex}")
+            return None
