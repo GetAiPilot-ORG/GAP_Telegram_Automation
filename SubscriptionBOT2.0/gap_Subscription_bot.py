@@ -1,7 +1,7 @@
 import os
 import re
 import base64
-import logging
+import logging    
 from datetime import datetime, timezone
 
 import requests
@@ -186,9 +186,6 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [("token", "eq", p)],
             )
             if deeplink:
-                if deeplink.get("used_at"):
-                    await msg.reply_text("❌ This link was already used.")
-                    return
                 subscription_id = deeplink.get("subscription_id")
                 break
 

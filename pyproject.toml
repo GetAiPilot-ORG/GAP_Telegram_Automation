@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "getaipilot-telegram-common"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["cryptography==50.0.1", "telethon==1.45.0"]
+
+[tool.setuptools.packages.find]
+include = ["telegram_common", "telegram_common.*"]
+exclude = ["telegram_common.tests*"]

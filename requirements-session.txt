@@ -1,0 +1,2 @@
+# Shared session foundation; install before opting a service into the new store.
+cryptography==50.0.1

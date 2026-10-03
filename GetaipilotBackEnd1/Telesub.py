@@ -4,10 +4,11 @@ import logging
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Header, Body, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
+from uuid import UUID
 from telethon import TelegramClient, functions, types
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
+from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
 from telethon.sessions import StringSession
 from supabase import create_client, Client
 import hashlib
@@ -16,6 +17,10 @@ import hmac
 from dotenv import load_dotenv
 
 load_dotenv()
+DURABLE_LOGIN_ENABLED = os.getenv("TELEGRAM_DURABLE_LOGIN", "false").lower() == "true"
+if DURABLE_LOGIN_ENABLED:
+    from telegram_common import SessionEncryption
+    from telegram_common.login import DurableLogin, LoginError, SupabaseLoginStore, credential_context
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
@@ -71,6 +76,64 @@ except Exception as e:
 
 
 clients = {}
+client_locks = {}
+_durable_login = None
+
+
+def get_durable_login():
+    global _durable_login
+    if _durable_login is None:
+        try:
+            service_key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+            if not service_key or not SUPABASE_URL or not API_ID or not API_HASH:
+                raise ValueError
+            cipher = SessionEncryption.from_environment()
+            admin = create_client(SUPABASE_URL, service_key)
+            _durable_login = DurableLogin(SupabaseLoginStore(admin), cipher,
+                lambda session: TelegramClient(StringSession(session), int(API_ID), API_HASH,
+                    flood_sleep_threshold=0, receive_updates=False, connection_retries=1))
+        except (KeyError, ValueError):
+            raise HTTPException(status_code=503, detail="Durable Telegram login is not configured") from None
+    return _durable_login
+
+
+def login_http_error(error):
+    headers = {"Retry-After": str(error.retry_after)} if error.retry_after is not None else None
+    return HTTPException(status_code=error.status_code, headers=headers, detail={
+        "code": error.code, "message": error.message, "restart": error.restart,
+        "retry_after": error.retry_after,
+    })
+
+
+async def discard_cached_client(user_id):
+    lock = client_locks.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        cached = clients.pop(user_id, None)
+        if cached:
+            try:
+                await cached.disconnect()
+            except Exception as error:
+                logger.warning("Cached Telegram client disconnect failed for user %s (%s)", user_id, type(error).__name__)
+
+
+async def retry_telegram_metadata(user_id, sb, phone=None):
+    """Metadata failures must not turn successful authentication into an OTP error."""
+    runtime = get_durable_login()
+    try:
+        row = await runtime.store.credential(user_id)
+        if not row or row["state"] != "active" or not row.get("metadata_pending"):
+            return
+        def sync():
+            # New-mode credentials stay solely in the encrypted store.
+            sb.table("tg_accounts").upsert({
+                "user_id": user_id, "phone": phone or "Unknown", "session_file": "",
+                "is_active": True, "updated_at": datetime.utcnow().isoformat(),
+            }, on_conflict="user_id").execute()
+            sync_dashboard_telegram_id(sb, user_id, row["telegram_account_id"])
+        await asyncio.to_thread(sync)
+        await runtime.store.metadata_synced(row)
+    except Exception as error:
+        logger.warning("Telegram metadata sync pending for user %s (%s)", user_id, type(error).__name__)
 
 
 def get_authed_supabase(token: str) -> Client:
@@ -87,16 +150,22 @@ def get_authed_supabase(token: str) -> Client:
 
 
 class PhoneRequest(BaseModel):
-    phone: str
+    phone: str = Field(min_length=6, max_length=32)
 
 
 class OtpRequest(BaseModel):
-    otp: str
+    otp: str = Field(min_length=1, max_length=32)
+    attempt_id: Optional[UUID] = None
 
 
 class PasswordRequest(BaseModel):
-    password: str
+    password: str = Field(min_length=1, max_length=256)
     phone: Optional[str] = None
+    attempt_id: Optional[UUID] = None
+
+
+class AttemptRequest(BaseModel):
+    attempt_id: UUID
 
 
 class ChatIdRequest(BaseModel):
@@ -113,7 +182,7 @@ async def get_auth_context(authorization: str = Header(None)):
     token = authorization.replace("Bearer ", "")
     try:
         # Verify user JWT (GoTrue)
-        user_res = supabase.auth.get_user(token)
+        user_res = await asyncio.to_thread(supabase.auth.get_user, token)
         if not user_res or not user_res.user:
             raise HTTPException(status_code=401, detail="Invalid Token")
         return {"user": user_res.user, "token": token}
@@ -122,6 +191,31 @@ async def get_auth_context(authorization: str = Header(None)):
 
 
 async def get_telegram_client(user_id: str, sb: Client = None):
+    # Status checks and login requests can arrive together. Only one client
+    # may be created per user or the pending Telegram auth key/hash is lost.
+    lock = client_locks.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        return await _get_telegram_client(user_id, sb)
+
+
+async def _get_telegram_client(user_id: str, sb: Client = None):
+    encrypted_row = None
+    if DURABLE_LOGIN_ENABLED:
+        runtime = get_durable_login()
+        try:
+            encrypted_row = await runtime.store.credential(user_id)
+        except LoginError as error:
+            raise login_http_error(error) from None
+        cached = clients.get(user_id)
+        if encrypted_row and cached and (
+            encrypted_row["state"] != "active"
+            or getattr(cached, "_credential_version", None) != encrypted_row["version"]
+        ):
+            await cached.disconnect()
+            clients.pop(user_id, None)
+        if encrypted_row and encrypted_row["state"] == "revoking":
+            raise HTTPException(status_code=409, detail="Telegram logout is pending")
+
     if user_id in clients:
         client = clients[user_id]
         if not client.is_connected():
@@ -137,7 +231,15 @@ async def get_telegram_client(user_id: str, sb: Client = None):
     session_target = StringSession("")
     is_legacy_file = False
 
-    if sb:
+    if encrypted_row:
+        if encrypted_row["state"] == "active":
+            try:
+                session_target = StringSession(runtime.encryption.decrypt(
+                    encrypted_row["encrypted_session"], credential_context(encrypted_row)))
+            except ValueError:
+                raise HTTPException(status_code=503, detail="Unable to decrypt Telegram session") from None
+        # Revoked/needs_reauth rows deliberately block fallback to old credentials.
+    elif sb:
         try:
             res = sb.table("tg_accounts").select("session_file").eq("user_id", user_id).maybe_single().execute()
             if res and res.data and res.data.get("session_file"):
@@ -170,7 +272,7 @@ async def get_telegram_client(user_id: str, sb: Client = None):
     # Auto-migrate legacy file to database StringSession
     if is_legacy_file and await client.is_user_authorized() and sb:
         try:
-            new_session_string = client.session.save()
+            new_session_string = StringSession.save(client.session)
             sb.table("tg_accounts").update({
                 "session_file": new_session_string
             }).eq("user_id", user_id).execute()
@@ -179,6 +281,8 @@ async def get_telegram_client(user_id: str, sb: Client = None):
             logger.error(f"Failed to auto-migrate legacy session for {user_id}: {e}")
 
     clients[user_id] = client
+    if encrypted_row:
+        client._credential_version = encrypted_row["version"]
 
     return client
 
@@ -247,6 +351,8 @@ async def get_status(ctx: dict = Depends(get_auth_context)):
     logger.info(
         f"User {user_id} status: {'connected' if is_connected else 'disconnected'}"
     )
+    if DURABLE_LOGIN_ENABLED and is_connected:
+        await retry_telegram_metadata(user_id, sb, phone)
     return {"connected": is_connected, "phone": phone}
 
 
@@ -256,17 +362,24 @@ async def login_start(request: PhoneRequest, ctx: dict = Depends(get_auth_contex
     token = ctx["token"]
     sb = get_authed_supabase(token)
     user_id = user.id
-    logger.info(f"Login start for user: {user_id}, phone: {request.phone}")
+    logger.info("Login start for user: %s", user_id)
     client = await get_telegram_client(user_id, sb)
 
     if await client.is_user_authorized():
         logger.info(f"User {user_id} already connected")
         return {"status": "already_connected"}
 
+    if DURABLE_LOGIN_ENABLED:
+        try:
+            return await get_durable_login().start(user_id, request.phone)
+        except LoginError as error:
+            raise login_http_error(error) from None
+
     try:
-        await client.send_code_request(request.phone)
+        sent_code = await client.send_code_request(request.phone)
         client._phone_number = request.phone
-        logger.info(f"OTP sent to {request.phone} for user {user_id}")
+        client._login_code_hash = sent_code.phone_code_hash
+        logger.info("OTP sent for user %s", user_id)
         return {"status": "otp_sent"}
     except Exception as e:
         logger.error(f"Login start failed for {user_id}: {str(e)}")
@@ -279,13 +392,26 @@ async def login_otp(request: OtpRequest, ctx: dict = Depends(get_auth_context)):
     token = ctx["token"]
     sb = get_authed_supabase(token)
     user_id = user.id
+    if DURABLE_LOGIN_ENABLED:
+        try:
+            result = await get_durable_login().verify(user_id, request.attempt_id, "otp", request.otp)
+        except LoginError as error:
+            raise login_http_error(error) from None
+        if result["status"] == "connected":
+            await discard_cached_client(user_id)
+            await retry_telegram_metadata(user_id, sb, result.get("phone"))
+        return result
     client = await get_telegram_client(user_id, sb)
 
-    if not hasattr(client, "_phone_number"):
-        raise HTTPException(status_code=400, detail="Please start login first")
+    if not getattr(client, "_phone_number", None) or not getattr(client, "_login_code_hash", None):
+        raise HTTPException(status_code=400, detail="Login session is missing. Please request a new code.")
 
     try:
-        await client.sign_in(client._phone_number, request.otp)
+        await client.sign_in(
+            client._phone_number,
+            request.otp.strip(),
+            phone_code_hash=client._login_code_hash,
+        )
 
         # Save to telegram_accounts on success
         me = await client.get_me()
@@ -308,6 +434,13 @@ async def login_otp(request: OtpRequest, ctx: dict = Depends(get_auth_context)):
         return {"status": "needs_password", "next": "password_required"}
     except PhoneCodeInvalidError:
         raise HTTPException(status_code=400, detail="Invalid OTP")
+    except PhoneCodeExpiredError:
+        client._login_code_hash = None
+        logger.warning("Telegram rejected an expired login code for user %s", user_id)
+        raise HTTPException(
+            status_code=400,
+            detail="Telegram has expired this code. Please restart login and enter the latest code.",
+        )
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -320,6 +453,14 @@ async def login_password(
     token = ctx["token"]
     sb = get_authed_supabase(token)
     user_id = user.id
+    if DURABLE_LOGIN_ENABLED:
+        try:
+            result = await get_durable_login().verify(user_id, request.attempt_id, "password", request.password)
+        except LoginError as error:
+            raise login_http_error(error) from None
+        await discard_cached_client(user_id)
+        await retry_telegram_metadata(user_id, sb, result.get("phone"))
+        return result
     client = await get_telegram_client(user_id, sb)
 
     try:
@@ -328,7 +469,7 @@ async def login_password(
         if not phone and hasattr(client, "_phone_number"):
             phone = client._phone_number
 
-        logger.info(f"Attempting password login for user {user_id} with phone {phone}")
+        logger.info("Attempting password login for user %s", user_id)
 
         if phone:
             await client.sign_in(phone=phone, password=request.password)
@@ -358,6 +499,26 @@ async def login_password(
     except Exception as e:
         logger.error(f"Login password failed for {user_id}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.get("/telegram/login/attempt/{attempt_id}")
+async def resume_login(attempt_id: UUID, ctx: dict = Depends(get_auth_context)):
+    if not DURABLE_LOGIN_ENABLED:
+        raise HTTPException(status_code=404, detail="Durable login is not enabled")
+    try:
+        return await get_durable_login().resume(ctx["user"].id, attempt_id)
+    except LoginError as error:
+        raise login_http_error(error) from None
+
+
+@app.post("/telegram/login/cancel")
+async def cancel_login(request: AttemptRequest, ctx: dict = Depends(get_auth_context)):
+    if not DURABLE_LOGIN_ENABLED:
+        raise HTTPException(status_code=404, detail="Durable login is not enabled")
+    try:
+        return await get_durable_login().cancel(ctx["user"].id, request.attempt_id)
+    except LoginError as error:
+        raise login_http_error(error) from None
 
 
 @app.get("/telegram/chats")
@@ -624,6 +785,21 @@ async def tg_logout(ctx: dict = Depends(get_auth_context)):
     sb = get_authed_supabase(token)
     user_id = user.id
     logger.info(f"Logout requested for user: {user_id}")
+
+    if DURABLE_LOGIN_ENABLED:
+        try:
+            await discard_cached_client(user_id)
+            result = await get_durable_login().logout(user_id)
+        except LoginError as error:
+            raise login_http_error(error) from None
+        if result is not None:
+            try:
+                await asyncio.to_thread(lambda: sb.table("tg_accounts").update({
+                    "is_active": False, "session_file": "",
+                }).eq("user_id", user_id).execute())
+            except Exception as error:
+                logger.warning("Telegram logout metadata pending for user %s (%s)", user_id, type(error).__name__)
+            return result
 
     try:
         if user_id in clients:
