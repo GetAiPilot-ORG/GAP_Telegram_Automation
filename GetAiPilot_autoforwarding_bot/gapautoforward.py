@@ -1,9 +1,11 @@
 import os, re, asyncio, json, base64, sys
 from telethon.tl import types
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo  # <-- NEW
-
-IST = ZoneInfo("Asia/Kolkata")  # <-- NEW: India time zone
+try:
+    from zoneinfo import ZoneInfo
+    IST = ZoneInfo("Asia/Kolkata")
+except Exception:
+    IST = timezone(timedelta(hours=5, minutes=30))
 
 from typing import Dict, List, Tuple, Set, Any, Optional
 
@@ -24,9 +26,9 @@ if os.path.exists(DOTENV_PATH):
 else:
     load_dotenv()
 
-API_ID        = int(os.getenv("API_ID", "0"))
-API_HASH      = os.getenv("API_HASH", "").strip()
-BOT_TOKEN     = os.getenv("BOT_TOKEN", "").strip()
+API_ID        = int(os.getenv("API_ID") or os.getenv("TELEGRAM_API_ID") or "0")
+API_HASH      = (os.getenv("API_HASH") or os.getenv("TELEGRAM_API_HASH") or "").strip()
+BOT_TOKEN     = (os.getenv("BOT_TOKEN") or os.getenv("AUTOFWD_BOT_TOKEN") or "").strip()
 SUPABASE_URL  = os.getenv("SUPABASE_URL", "").strip()
 # Prioritize service role key for backend bots, fallback to SUPABASE_KEY
 SUPABASE_KEY  = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")).strip()
@@ -62,6 +64,10 @@ except Exception as ex:
     raise
 
 bot_session_path = os.path.join(SCRIPT_DIR, "login_bot_runner")
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 bot = TelegramClient(bot_session_path, API_ID, API_HASH).start(bot_token=BOT_TOKEN)
 
 PHONE_RE = re.compile(r"^\+\d{6,15}$", re.IGNORECASE)
@@ -525,16 +531,77 @@ def sp_get_forwarding_users() -> List[int]:
 
 def sp_get_app_subscription_by_telegram_user_id(uid_tg: int) -> Optional[dict]:
     """
-    Dashboard creates/updates app_user_subscriptions.
-    Bot only reads it by telegram_user_id.
+    Dashboard creates/updates app_user_subscriptions and profiles.
+    Reads subscription by telegram_user_id, with fallback to profiles table
+    and admin status resolution.
     """
     try:
+        # 1️⃣ Primary: Look up directly in app_user_subscriptions by telegram_user_id
         res = supabase.table("app_user_subscriptions") \
+            .select("*") \
+            .eq("telegram_user_id", int(uid_tg)) \
+            .order("expires_at", desc=True) \
+            .limit(1) \
+            .execute()
+        rows = res.data or []
+        if rows and sp_is_sub_active(rows[0]):
+            return rows[0]
+
+        # 2️⃣ Fallback: Look up via profiles table (handles web-dashboard connected accounts)
+        p_res = supabase.table("profiles") \
             .select("*") \
             .eq("telegram_user_id", int(uid_tg)) \
             .limit(1) \
             .execute()
-        rows = res.data or []
+        p_rows = p_res.data or []
+        if p_rows:
+            p = p_rows[0]
+            # Admin users have full unlocked platform access
+            if p.get("is_admin"):
+                return {
+                    "user_id": p.get("id"),
+                    "telegram_user_id": int(uid_tg),
+                    "plan_id": "premium",
+                    "plan_label": "Admin Access (Full Suite)",
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(days=3650)).isoformat(),
+                    "is_admin": True
+                }
+
+            user_uuid = p.get("id")
+            if user_uuid:
+                sub_res = supabase.table("app_user_subscriptions") \
+                    .select("*") \
+                    .eq("user_id", user_uuid) \
+                    .order("expires_at", desc=True) \
+                    .limit(1) \
+                    .execute()
+                sub_rows = sub_res.data or []
+                if sub_rows:
+                    sub = sub_rows[0]
+                    # Self-heal telegram_user_id on app_user_subscriptions row if missing
+                    if sub.get("telegram_user_id") != int(uid_tg):
+                        try:
+                            supabase.table("app_user_subscriptions") \
+                                .update({"telegram_user_id": int(uid_tg)}) \
+                                .eq("user_id", user_uuid) \
+                                .execute()
+                        except Exception:
+                            pass
+                    if sp_is_sub_active(sub):
+                        return sub
+
+            # Profile subscription string assigned directly (e.g. by admin)
+            p_sub = p.get("subscription")
+            if p_sub and str(p_sub).strip().lower() not in ("free", "none", "", "null"):
+                return {
+                    "user_id": p.get("id"),
+                    "telegram_user_id": int(uid_tg),
+                    "plan_id": str(p_sub),
+                    "plan_label": str(p_sub),
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(days=365)).isoformat(),
+                }
+
+        # Return the latest row if found even if expired (for messaging status)
         return rows[0] if rows else None
     except Exception as ex:
         print("sp_get_app_subscription_by_telegram_user_id error:", ex)
@@ -543,6 +610,8 @@ def sp_get_app_subscription_by_telegram_user_id(uid_tg: int) -> Optional[dict]:
 def sp_is_sub_active(app_sub: Optional[dict]) -> bool:
     if not app_sub:
         return False
+    if app_sub.get("is_admin"):
+        return True
     exp_raw = app_sub.get("expires_at")
     if not exp_raw:
         return False
@@ -626,16 +695,33 @@ def sp_link_telegram_to_app_user(user_uuid: str, telegram_user_id: int) -> bool:
     try:
         now = datetime.now(timezone.utc).isoformat()
         telegram_id = int(telegram_user_id)
-        supabase.table("app_user_subscriptions").upsert(
-            {
-                "user_id": user_uuid,
-                "telegram_user_id": telegram_id,
-                "updated_at": now,
-            },
-            on_conflict="user_id"
-        ).execute()
-        # Some dashboard screens still read profiles while others read the
-        # subscription row. Keep both projections synchronized.
+        
+        # 1. Update app_user_subscriptions
+        existing = supabase.table("app_user_subscriptions") \
+            .select("user_id") \
+            .eq("user_id", user_uuid) \
+            .limit(1) \
+            .execute()
+        if existing.data:
+            supabase.table("app_user_subscriptions").update(
+                {
+                    "telegram_user_id": telegram_id,
+                    "updated_at": now,
+                }
+            ).eq("user_id", user_uuid).execute()
+        else:
+            supabase.table("app_user_subscriptions").insert(
+                {
+                    "user_id": user_uuid,
+                    "telegram_user_id": telegram_id,
+                    "plan_id": "free_trial",
+                    "plan_label": "Free Trial",
+                    "expires_at": (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
+                    "updated_at": now,
+                }
+            ).execute()
+
+        # 2. Update profiles table
         supabase.table("profiles").update(
             {"telegram_user_id": telegram_id}
         ).eq("id", user_uuid).execute()
@@ -649,6 +735,7 @@ def sp_get_app_subscription_by_user_id(user_uuid: str) -> dict | None:
         res = supabase.table("app_user_subscriptions") \
             .select("*") \
             .eq("user_id", user_uuid) \
+            .order("expires_at", desc=True) \
             .limit(1) \
             .execute()
         rows = res.data or []
@@ -662,13 +749,31 @@ def format_app_plan_block(app_sub: dict | None) -> str:
     """
     Output:
     ✅ Your Plan is ACTIVE
-    Plan name: Pro Semi-Annual
+    Plan name: Telegram Standard (Bundle)
     Expires on: 14 Jul 2026
     """
     if not app_sub:
         return "⚠️ No dashboard subscription found for this account.\n"
 
-    plan_label = (app_sub.get("plan_label") or app_sub.get("plan_id") or "—").strip()
+    plan_label = "Active Plan"
+    raw_label = app_sub.get("plan_label") or app_sub.get("plan_id") or ""
+
+    if app_sub.get("is_admin"):
+        plan_label = "Admin Access (Full Suite)"
+    elif isinstance(raw_label, str) and raw_label.strip().startswith("[") and raw_label.strip().endswith("]"):
+        try:
+            items = json.loads(raw_label)
+            tg_items = [i for i in items if "telegram" in str(i).lower() or "bundle" in str(i).lower() or "all_in_one" in str(i).lower()]
+            if tg_items:
+                formatted = [str(i).replace("_", " ").title() for i in tg_items]
+                plan_label = ", ".join(formatted) + " (Bundle)"
+            else:
+                formatted = [str(i).replace("_", " ").title() for i in items]
+                plan_label = ", ".join(formatted)
+        except Exception:
+            plan_label = str(raw_label).strip()
+    elif raw_label:
+        plan_label = str(raw_label).replace("_", " ").title()
 
     exp_raw = app_sub.get("expires_at")
     status_line = "⚠️ Your Plan status is UNKNOWN"
@@ -676,12 +781,11 @@ def format_app_plan_block(app_sub: dict | None) -> str:
 
     try:
         if exp_raw:
-            # handle both "2026-01-15 08:24:56.217+00" and iso formats
             exp_str = str(exp_raw).replace("Z", "+00:00").replace(" ", "T", 1)
             exp_dt = datetime.fromisoformat(exp_str)
             now = datetime.now(timezone.utc)
 
-            if exp_dt >= now:
+            if exp_dt >= now or app_sub.get("is_admin"):
                 status_line = "✅ Your Plan is *ACTIVE*"
             else:
                 status_line = "❌ Your Plan is *EXPIRED*"
@@ -896,16 +1000,70 @@ def get_user_plan_level(uid: int):
     if not sub:
         return "free", PLAN_LEVEL["free"]
 
-    pid = str(sub.get("plan_id") or "").lower()
+    if sub.get("is_admin"):
+        return "premium", PLAN_LEVEL["premium"]
 
-    # demo = premium access
-    if pid in ("demo_premium", "demo", "trial"):
-        pid = "premium"
+    raw_pid = sub.get("plan_id")
+    pids = []
+    if isinstance(raw_pid, list):
+        pids = [str(x).lower() for x in raw_pid]
+    elif isinstance(raw_pid, str):
+        val = raw_pid.strip()
+        if val.startswith("[") and val.endswith("]"):
+            try:
+                parsed = json.loads(val)
+                if isinstance(parsed, list):
+                    pids = [str(x).lower() for x in parsed]
+            except Exception:
+                pids = [val.lower()]
+        else:
+            pids = [val.lower()]
+    else:
+        pids = [str(raw_pid or "").lower()]
 
-    if pid not in PLAN_LEVEL:
-        pid = "premium"  # fallback for old users
+    # Also check plan_label and raw.active_plans
+    raw_label = sub.get("plan_label")
+    if isinstance(raw_label, str) and raw_label.strip().startswith("[") and raw_label.strip().endswith("]"):
+        try:
+            parsed_label = json.loads(raw_label)
+            if isinstance(parsed_label, list):
+                pids.extend([str(x).lower() for x in parsed_label])
+        except Exception:
+            pass
 
-    return pid, PLAN_LEVEL[pid]
+    raw_obj = sub.get("raw")
+    if isinstance(raw_obj, dict) and isinstance(raw_obj.get("active_plans"), list):
+        for ap in raw_obj["active_plans"]:
+            if isinstance(ap, dict) and ap.get("plan_id"):
+                pids.append(str(ap["plan_id"]).lower())
+
+    pids_joined = " ".join(pids)
+
+    # 1. Admin / Bundle / All-In-One / Ultimate / Max
+    if any(k in pids_joined for k in ("all_in_one", "bundle", "ultimate", "gap_max", "gap_pro", "gap_core", "full stack")):
+        return "premium", PLAN_LEVEL["premium"]
+
+    # 2. Telegram specific tiers
+    if any(k in pids_joined for k in ("telegram_standard", "telegram_pro", "tg_pro", "telegram_monthly", "telegram_3_month", "telegram_suite")):
+        return "premium", PLAN_LEVEL["premium"]
+
+    if any(k in pids_joined for k in ("telegram_basic", "tg_basic", "telegram_starter", "tg lite")):
+        return "basic", PLAN_LEVEL["basic"]
+
+    # 3. Demo / Trial
+    if any(k in pids_joined for k in ("demo_premium", "demo", "trial", "free_trial")):
+        return "premium", PLAN_LEVEL["premium"]
+
+    # 4. Direct PLAN_LEVEL match
+    for pid in pids:
+        if pid in PLAN_LEVEL and pid != "free":
+            return pid, PLAN_LEVEL[pid]
+
+    # 5. Fallback for any active paid plan
+    if pids and any(p not in ("", "free", "none") for p in pids):
+        return "premium", PLAN_LEVEL["premium"]
+
+    return "free", PLAN_LEVEL["free"]
 
 
 async def premium_or_hint(e) -> bool:
@@ -988,6 +1146,8 @@ async def start_cmd(e):
 
     # only fetch subscription if link succeeded
     app_sub = sp_get_app_subscription_by_user_id(payload)
+    if not app_sub:
+        app_sub = sp_get_app_subscription_by_telegram_user_id(uid_tg)
 
     linked_msg = "✅ Dashboard account linked successfully!\n\n"
 
@@ -1788,7 +1948,10 @@ async def _handle_forward_event(uid: int, evt):
         if not state:
             return
 
-        uclient: TelegramClient = state["client"]
+        uclient: TelegramClient = state.get("client")
+        if not uclient:
+            print(f"⚠️ [FORWARD-WARN] uclient is None for user {uid}")
+            return
         mapping: Dict[int, List[int]] = state["mapping"]
         compiled_now = state.get("filters", [])
         curr_blacklist = state.get("blacklist", [])
@@ -1921,8 +2084,9 @@ async def _handle_forward_event(uid: int, evt):
                     elif msg.sticker:
                         await uclient.send_file(int(t), msg.sticker, caption=text or "")
 
-                    elif msg.animation:
-                        await uclient.send_file(int(t), msg.animation, caption=text or "")
+                    elif getattr(msg, "gif", None) or getattr(msg, "animation", None):
+                        anim = getattr(msg, "gif", None) or getattr(msg, "animation", None)
+                        await uclient.send_file(int(t), anim, caption=text or "")
 
                     elif msg.video_note:
                         await uclient.send_file(int(t), msg.video_note, caption=text or "")
@@ -1950,6 +2114,22 @@ async def _handle_forward_event(uid: int, evt):
             # per-target chhota sa throttle
             await asyncio.sleep(FORWARD_THROTTLE)
 
+        # --- OPTIONAL PRIVATE BROADCAST RELAY INTEGRATION ---
+        # If PRIVATE_BROADCAST_RELAY_CHAT_ID is set, relay a copy of the source post to the private broadcast relay
+        relay_chat_id_env = os.getenv("PRIVATE_BROADCAST_RELAY_CHAT_ID") or os.getenv("GAP_PRIVATE_BROADCAST_RELAY_CHAT_ID")
+        if relay_chat_id_env:
+            try:
+                relay_chat_id = int(relay_chat_id_env.strip())
+                if relay_chat_id not in targets:
+                    if has_media:
+                        await uclient.send_file(relay_chat_id, file=msg.media, caption=text or "")
+                    elif text:
+                        await uclient.send_message(relay_chat_id, text)
+            except Exception as relay_ex:
+                print(f"⚠️ [AUTOFORWARD-RELAY-ERR] Failed to copy message to relay channel: {relay_ex}")
+
+    except errors.common.TypeNotFoundError as typ_ex:
+        print(f"⚠️ [TL-TYPE-ERR] Telegram server returned unrecognized TL Object ID: {typ_ex}")
     except Exception as ex:
         print("forward handler err:", ex)
     
@@ -2492,7 +2672,10 @@ async def resume_forwarding_on_start():
                 async def respond(self, *args, **kwargs):
                     # /work normally e.respond(...) use karta hai,
                     # hum usko bridge kar rahe hain bot.send_message se.
-                    await bot.send_message(self.sender_id, *args, **kwargs)
+                    try:
+                        await bot.send_message(self.sender_id, *args, **kwargs)
+                    except Exception as ex:
+                        print(f"⚠️ FakeEvent respond warning for {self.sender_id}: {ex}")
 
             await cmd_work(FakeEvent())
 

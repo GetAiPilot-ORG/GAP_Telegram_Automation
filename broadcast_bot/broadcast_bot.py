@@ -51,32 +51,149 @@ supabase: AsyncClient = None
 # {user_id: {'step': 'selecting_channel', 'channel_id': '...', 'channel_name': '...', 'message_data': {...}}}
 user_states = {}
 
+async def get_owner_user_ids(tg_user_id):
+    if not supabase: return []
+    user_ids = set()
+    for val in [tg_user_id, str(tg_user_id)]:
+        try:
+            r1 = await supabase.table('profiles').select('id').eq('telegram_user_id', val).execute()
+            for r in getattr(r1, 'data', []) or []:
+                if r.get('id'): user_ids.add(r['id'])
+        except Exception as e:
+            logger.warning(f"Error querying profiles for tg_user_id {val}: {e}")
+        try:
+            r2 = await supabase.table('app_user_subscriptions').select('user_id').eq('telegram_user_id', val).execute()
+            for r in getattr(r2, 'data', []) or []:
+                if r.get('user_id'): user_ids.add(r['user_id'])
+        except Exception as e:
+            logger.warning(f"Error querying app_user_subscriptions for tg_user_id {val}: {e}")
+    return list(user_ids)
+
 async def get_owner_data(tg_user_id):
     if not supabase: return None
-    # Try profiles first
-    res = await supabase.table('profiles').select('id').eq('telegram_user_id', tg_user_id).execute()
-    data = getattr(res, 'data', [])
-    if data:
-        return data[0]
-    
-    # Try subscriptions as fallback
-    res = await supabase.table('app_user_subscriptions').select('user_id').eq('telegram_user_id', tg_user_id).execute()
-    data = getattr(res, 'data', [])
-    if data:
-        return {'id': data[0]['user_id']}
-        
-    return None
+    user_ids = await get_owner_user_ids(tg_user_id)
+    if not user_ids:
+        return None
+    # Pick the user_id that owns tracker bots or active records
+    for uid in user_ids:
+        try:
+            t_res = await supabase.table('tg_tracker').select('id').eq('user_id', uid).limit(1).execute()
+            if getattr(t_res, 'data', []):
+                return {'id': uid, 'all_ids': user_ids}
+        except Exception:
+            pass
+    return {'id': user_ids[0], 'all_ids': user_ids}
 
-async def get_owner_channels(user_id):
+async def get_owner_channels(user_id_or_tg_id):
     if not supabase: return []
-    bots_res = await supabase.table('tg_tracker').select('id').eq('user_id', user_id).execute()
-    bots_data = getattr(bots_res, 'data', [])
-    if not bots_data:
+    
+    # Resolve all associated user IDs
+    user_ids = set()
+    if isinstance(user_id_or_tg_id, int) or (isinstance(user_id_or_tg_id, str) and user_id_or_tg_id.isdigit()):
+        user_ids = set(await get_owner_user_ids(user_id_or_tg_id))
+    else:
+        user_ids.add(str(user_id_or_tg_id))
+        # Also find any other user IDs tied to same Telegram user ID
+        try:
+            p_res = await supabase.table('profiles').select('telegram_user_id').eq('id', user_id_or_tg_id).execute()
+            p_data = getattr(p_res, 'data', []) or []
+            if p_data and p_data[0].get('telegram_user_id'):
+                user_ids.update(await get_owner_user_ids(p_data[0]['telegram_user_id']))
+        except Exception:
+            pass
+
+    if not user_ids:
         return []
-    bot_ids = [b['id'] for b in bots_data]
-    mappings_res = await supabase.table('tg_bot_channel_mappings').select('channel_id, channel_name').in_('bot_id', bot_ids).eq('status', 'Active').execute()
-    mappings_data = getattr(mappings_res, 'data', [])
-    return mappings_data
+
+    user_ids_list = list(user_ids)
+    channels = []
+    seen_clean_ids = set()
+
+    # 1. Fetch tracker bots for these users
+    bots_res = await supabase.table('tg_tracker').select('id, bot_name, bot_token, channel_id, channel_name, status').in_('user_id', user_ids_list).execute()
+    bots = getattr(bots_res, 'data', []) or []
+    bot_ids = [b['id'] for b in bots if b.get('id')]
+
+    # 2. Fetch from tg_bot_channel_mappings (Tracker Mappings)
+    if bot_ids:
+        try:
+            mappings_res = await supabase.table('tg_bot_channel_mappings').select('id, bot_id, channel_id, channel_name, status').in_('bot_id', bot_ids).execute()
+            for m in getattr(mappings_res, 'data', []) or []:
+                cid = m.get('channel_id')
+                cname = m.get('channel_name')
+                st = (m.get('status') or '').lower()
+                if cid and st not in ['deleted', 'removed']:
+                    clean = str(cid).replace('-100', '').replace('-', '')
+                    if clean and clean not in seen_clean_ids:
+                        seen_clean_ids.add(clean)
+                        channels.append({
+                            'channel_id': cid,
+                            'clean_id': clean,
+                            'channel_name': cname or f"Channel {clean}",
+                            'source': 'tracker_mapping',
+                            'bot_id': m.get('bot_id'),
+                            'mapping_id': m.get('id')
+                        })
+        except Exception as e:
+            logger.warning(f"Error fetching tg_bot_channel_mappings: {e}")
+
+    # 3. Direct channels on tg_tracker
+    for b in bots:
+        cid = b.get('channel_id')
+        cname = b.get('channel_name')
+        if cid and cname:  # Only if a valid channel name exists
+            clean = str(cid).replace('-100', '').replace('-', '')
+            if clean and clean not in seen_clean_ids:
+                seen_clean_ids.add(clean)
+                channels.append({
+                    'channel_id': cid,
+                    'clean_id': clean,
+                    'channel_name': cname,
+                    'source': 'tracker_direct',
+                    'bot_id': b.get('id')
+                })
+
+    # 4. Fetch from tg_communities (Telesub / Subscription Channels)
+    try:
+        comm_res = await supabase.table('tg_communities').select('id, telegram_chat_id, title').in_('user_id', user_ids_list).execute()
+        for c in getattr(comm_res, 'data', []) or []:
+            cid = c.get('telegram_chat_id')
+            cname = c.get('title')
+            if cid:
+                clean = str(cid).replace('-100', '').replace('-', '')
+                if clean and clean not in seen_clean_ids:
+                    seen_clean_ids.add(clean)
+                    channels.append({
+                        'channel_id': cid,
+                        'clean_id': clean,
+                        'channel_name': cname or f"Community {clean}",
+                        'source': 'community',
+                        'community_id': c.get('id')
+                    })
+    except Exception as e:
+        logger.warning(f"Error fetching tg_communities: {e}")
+
+    # 5. Fetch from tg_autopost_channels
+    try:
+        ap_res = await supabase.table('tg_autopost_channels').select('channel_id, channel_title, bot_id').in_('user_id', user_ids_list).execute()
+        for a in getattr(ap_res, 'data', []) or []:
+            cid = a.get('channel_id')
+            cname = a.get('channel_title')
+            if cid:
+                clean = str(cid).replace('-100', '').replace('-', '')
+                if clean and clean not in seen_clean_ids:
+                    seen_clean_ids.add(clean)
+                    channels.append({
+                        'channel_id': cid,
+                        'clean_id': clean,
+                        'channel_name': cname or f"Channel {clean}",
+                        'source': 'autopost',
+                        'bot_id': a.get('bot_id')
+                    })
+    except Exception as e:
+        logger.warning(f"Error fetching tg_autopost_channels: {e}")
+
+    return channels
 
 async def main():
     global supabase
@@ -143,23 +260,25 @@ async def main():
             sender = await event.get_sender()
             owner_data = await get_owner_data(sender.id)
             if not owner_data:
-                await event.respond("Owner verification failed.")
+                await event.respond("Owner verification failed. Please connect your Telegram account from the dashboard.")
                 return
 
-            channels = await get_owner_channels(owner_data.get('id'))
+            channels = await get_owner_channels(sender.id)
             if not channels:
-                await event.respond("No active channels found.")
+                await event.respond("No active channels found in your connected bots or tracker. Please make sure your channel is mapped in the GAP dashboard.")
                 return
 
             buttons = []
-            seen_ids = set()
+            available_channels = {}
             for ch in channels:
-                cid = ch.get('channel_id')
-                if cid and cid not in seen_ids:
-                    buttons.append([Button.inline(ch.get('channel_name') or "Unnamed", data=f"selchan_{cid}")])
-                    seen_ids.add(cid)
+                clean = ch.get('clean_id') or str(ch.get('channel_id')).replace("-100", "").replace("-", "")
+                available_channels[clean] = ch
+                buttons.append([Button.inline(ch.get('channel_name') or "Unnamed Channel", data=f"selchan_{clean}")])
 
-            user_states[sender.id] = {'step': 'selecting_channel'}
+            user_states[sender.id] = {
+                'step': 'selecting_channel',
+                'available_channels': available_channels
+            }
             await event.respond("Select the target channel audience:", buttons=buttons)
             return
 
@@ -199,17 +318,40 @@ async def main():
 
     @client.on(events.CallbackQuery(data=lambda d: d.decode().startswith('selchan_')))
     async def channel_selection_handler(event):
-        channel_id = event.data.decode().split('_')[1]
+        clean_id = event.data.decode().split('_', 1)[1]
         sender_id = event.sender_id
+        state = user_states.get(sender_id, {})
+        available = state.get('available_channels', {})
+        ch_info = available.get(clean_id)
         
-        try:
-            res = await supabase.table('tg_bot_channel_mappings').select('channel_name').eq('channel_id', channel_id).limit(1).execute()
-            channel_name = res.data[0]['channel_name'] if res.data else "Unknown"
-            user_states[sender_id] = {'step': 'awaiting_message', 'channel_id': channel_id, 'channel_name': channel_name}
-            await event.edit(f"✅ **{channel_name}** selected. Send your message now.")
-        except Exception as e:
-            logger.error(f"Selection error: {e}")
-            await event.answer("Error selecting channel.")
+        if ch_info:
+            channel_id = ch_info.get('channel_id')
+            channel_name = ch_info.get('channel_name') or "Channel"
+            bot_id = ch_info.get('bot_id')
+            source = ch_info.get('source')
+        else:
+            channel_id = clean_id
+            channel_name = "Channel"
+            bot_id = None
+            source = None
+            try:
+                res = await supabase.table('tg_bot_channel_mappings').select('channel_name, bot_id').in_('channel_id', [clean_id, f"-100{clean_id}"]).limit(1).execute()
+                if res.data:
+                    channel_name = res.data[0].get('channel_name') or "Channel"
+                    bot_id = res.data[0].get('bot_id')
+            except Exception:
+                pass
+
+        user_states[sender_id] = {
+            'step': 'awaiting_message',
+            'channel_id': channel_id,
+            'clean_id': clean_id,
+            'channel_name': channel_name,
+            'bot_id': bot_id,
+            'source': source,
+            'available_channels': available
+        }
+        await event.edit(f"✅ **{channel_name}** selected. Send your message now.")
 
     @client.on(events.CallbackQuery(data='confirm_send'))
     async def confirm_handler(event):
@@ -221,6 +363,7 @@ async def main():
 
         try:
             channel_id = state.get('channel_id')
+            clean_id = state.get('clean_id') or str(channel_id).replace("-100", "").replace("-", "")
             channel_name = state.get('channel_name') or "Channel"
             orig_msg = state.get('original_msg')
             media_path = state.get('media_path')
@@ -252,8 +395,7 @@ async def main():
                 logger.warning(f"Error inserting task into DB: {e}")
 
             # 3. Post to Channel
-            clean_cid = str(channel_id).replace("-100", "").replace("-", "")
-            target_peer = int(f"-100{clean_cid}")
+            target_peer = int(f"-100{clean_id}")
             
             channel_sent = False
             channel_error = None
@@ -273,34 +415,59 @@ async def main():
             # Attempt B: Fallback via channel's mapped bot in tg_tracker
             if not channel_sent:
                 try:
-                    m_res = await supabase.table('tg_bot_channel_mappings').select('bot_id').eq('channel_id', str(channel_id)).execute()
+                    possible_cids = [str(channel_id), clean_id, f"-100{clean_id}"]
+                    bot_tokens_to_try = []
+
+                    # If bot_id was recorded during channel selection
+                    if state.get('bot_id'):
+                        b_res = await supabase.table('tg_tracker').select('bot_token').eq('id', state['bot_id']).execute()
+                        for b in getattr(b_res, 'data', []) or []:
+                            if b.get('bot_token'):
+                                bot_tokens_to_try.append(b['bot_token'])
+
+                    # Check mappings
+                    m_res = await supabase.table('tg_bot_channel_mappings').select('bot_id').in_('channel_id', possible_cids).execute()
                     mappings = getattr(m_res, 'data', []) or []
                     for m in mappings:
                         b_res = await supabase.table('tg_tracker').select('bot_token').eq('id', m['bot_id']).execute()
-                        bots = getattr(b_res, 'data', []) or []
-                        if bots and bots[0].get('bot_token'):
-                            sub_token = bots[0]['bot_token']
-                            async with httpx.AsyncClient(timeout=15.0) as http:
-                                if media_path and os.path.exists(media_path):
-                                    with open(media_path, "rb") as f:
-                                        resp = await http.post(
-                                            f"https://api.telegram.org/bot{sub_token}/sendDocument",
-                                            data={"chat_id": target_peer, "caption": raw_text},
-                                            files={"document": f}
-                                        )
-                                        if resp.status_code == 200 and resp.json().get("ok"):
-                                            channel_sent = True
-                                            channel_error = None
-                                            break
-                                else:
+                        for b in getattr(b_res, 'data', []) or []:
+                            if b.get('bot_token') and b['bot_token'] not in bot_tokens_to_try:
+                                bot_tokens_to_try.append(b['bot_token'])
+
+                    # Check autopost bots if applicable
+                    try:
+                        ap_res = await supabase.table('tg_autopost_channels').select('bot_id').in_('channel_id', possible_cids).execute()
+                        for ap in getattr(ap_res, 'data', []) or []:
+                            if ap.get('bot_id'):
+                                ab_res = await supabase.table('tg_autopost_bots').select('bot_token').eq('id', ap['bot_id']).execute()
+                                for ab in getattr(ab_res, 'data', []) or []:
+                                    if ab.get('bot_token') and ab['bot_token'] not in bot_tokens_to_try:
+                                        bot_tokens_to_try.append(ab['bot_token'])
+                    except Exception:
+                        pass
+
+                    for sub_token in bot_tokens_to_try:
+                        async with httpx.AsyncClient(timeout=15.0) as http:
+                            if media_path and os.path.exists(media_path):
+                                with open(media_path, "rb") as f:
                                     resp = await http.post(
-                                        f"https://api.telegram.org/bot{sub_token}/sendMessage",
-                                        json={"chat_id": target_peer, "text": raw_text}
+                                        f"https://api.telegram.org/bot{sub_token}/sendDocument",
+                                        data={"chat_id": target_peer, "caption": raw_text},
+                                        files={"document": f}
                                     )
                                     if resp.status_code == 200 and resp.json().get("ok"):
                                         channel_sent = True
                                         channel_error = None
                                         break
+                            else:
+                                resp = await http.post(
+                                    f"https://api.telegram.org/bot{sub_token}/sendMessage",
+                                    json={"chat_id": target_peer, "text": raw_text}
+                                )
+                                if resp.status_code == 200 and resp.json().get("ok"):
+                                    channel_sent = True
+                                    channel_error = None
+                                    break
                 except Exception as ex:
                     logger.warning(f"Fallback bot failed: {ex}")
 
@@ -308,21 +475,30 @@ async def main():
             users_sent = 0
             users_total = 0
             try:
-                m_res = await supabase.table('tg_bot_channel_mappings').select('id, bot_id').eq('channel_id', str(channel_id)).execute()
+                possible_cids = [str(channel_id), clean_id, f"-100{clean_id}"]
+                m_res = await supabase.table('tg_bot_channel_mappings').select('id, bot_id').in_('channel_id', possible_cids).execute()
                 mappings = getattr(m_res, 'data', []) or []
-                for m in mappings:
-                    l_res = await supabase.table('tg_bot_join_links').select('id').eq('channel_mapping_id', m['id']).execute()
-                    link_ids = [l['id'] for l in getattr(l_res, 'data', [])]
-                    if not link_ids:
-                        l_res = await supabase.table('tg_bot_join_links').select('id').eq('bot_id', m['bot_id']).execute()
-                        link_ids = [l['id'] for l in getattr(l_res, 'data', [])]
+                
+                # Also include state bot_id if available
+                all_mapping_ids = [m['id'] for m in mappings if m.get('id')]
+                all_bot_ids = list(set([m['bot_id'] for m in mappings if m.get('bot_id')] + ([state.get('bot_id')] if state.get('bot_id') else [])))
+
+                link_ids = []
+                if all_mapping_ids:
+                    l_res = await supabase.table('tg_bot_join_links').select('id').in_('channel_mapping_id', all_mapping_ids).execute()
+                    link_ids.extend([l['id'] for l in getattr(l_res, 'data', []) if l.get('id')])
+                
+                if not link_ids and all_bot_ids:
+                    l_res = await supabase.table('tg_bot_join_links').select('id').in_('bot_id', all_bot_ids).execute()
+                    link_ids.extend([l['id'] for l in getattr(l_res, 'data', []) if l.get('id')])
+                
+                if link_ids:
+                    u_res = await supabase.table('tg_bot_join_users').select('telegram_user_id').in_('link_id', link_ids).execute()
+                    users = getattr(u_res, 'data', []) or []
+                    users_total += len(users)
                     
-                    if link_ids:
-                        u_res = await supabase.table('tg_bot_join_users').select('telegram_user_id').in_('link_id', link_ids).execute()
-                        users = getattr(u_res, 'data', []) or []
-                        users_total += len(users)
-                        
-                        b_res = await supabase.table('tg_tracker').select('bot_token').eq('id', m['bot_id']).execute()
+                    for b_id in all_bot_ids:
+                        b_res = await supabase.table('tg_tracker').select('bot_token').eq('id', b_id).execute()
                         b_data = getattr(b_res, 'data', []) or []
                         if b_data and b_data[0].get('bot_token'):
                             sub_token = b_data[0]['bot_token']
