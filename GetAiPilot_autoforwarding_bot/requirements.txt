@@ -1,0 +1,4 @@
+telethon==1.45.0
+cryptography==50.0.1
+python-dotenv
+supabase

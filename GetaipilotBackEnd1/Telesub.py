@@ -839,12 +839,13 @@ async def tg_logout(ctx: dict = Depends(get_auth_context)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-if __name__ == "__main__":
-    import uvicorn
 
-    host = os.getenv("HOST", "0.0.0.0")
-    port = int(os.getenv("PORT", "8002"))
-    uvicorn.run(app, host=host, port=port)
+# Separate AutoForward credentials and owner-bound login API.
+try:
+    from autoforward_api import build_router as build_autoforward_router
+except ModuleNotFoundError:
+    from GetaipilotBackEnd1.autoforward_api import build_router as build_autoforward_router
+app.include_router(build_autoforward_router(get_auth_context))
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,8 +1,12 @@
 # Durable login verification — 2026-10-03
 
 The database migrations are installed, and the automated checks passed.
-The new durable login flow is not deployed or enabled on the live backend.
-Applying the migrations alone does not fix the current production OTP issue.
+The updated backend is now deployed and healthy. Its durable-login feature flag
+and secret configuration have not been verified remotely. The updated dashboard
+is now deployed with the correct production API URL. The user confirmed that
+controlled-account login and refresh both work. Two-step password, pending-login
+refresh, and logout checks remain unconfirmed; the feature flag itself has not
+been inspected remotely.
 
 ## Main Supabase checks
 
@@ -47,16 +51,38 @@ and `src/pages/telegram/Telesub/telesubDashbaord.tsx:115`.
 
 ## Deployment status and remaining checks
 
-`https://tg.getaipilot.in/health` returns healthy. Unauthenticated Telegram
-status requests return 401. Its OpenAPI schema still has an OTP body containing
-only `otp`, with no attempt resume/cancel endpoints: the new backend is not live.
+Latest deployment check: live `TelesubDashboard-C24VAfMZ.js` contains
+`https://tg.getaipilot.in`, attempt-ID handling, refresh recovery, and cancel
+support. It no longer contains the previous localhost API URL. Backend health
+still reports healthy. The localhost issue described below is historical.
 
-The local backend flag is unset, so durable login defaults off. Its service-role
+After the backend deployment, `https://tg.getaipilot.in/health` returns healthy.
+Unauthenticated status and attempt-resume requests both return 401. Its OpenAPI
+schema now includes attempt IDs in OTP/password requests and the resume/cancel
+endpoints, confirming deployment of the updated backend code. These public checks
+do not prove the feature flag is enabled or the backend secrets are valid.
+
+On the first deployment check, the user confirmed deploying only the backend,
+and the live dashboard still sent only `{otp}`. After the subsequent frontend
+deployment, the live dashboard asset `TelesubDashboard-C_h9mP4n.js` now contains
+attempt IDs, the resume/cancel routes, and the attempt persistence marker.
+However, that bundle contains `http://127.0.0.1:8000` as its Telegram API URL and
+does not contain `https://tg.getaipilot.in`. This points visitors' browsers at
+their own machines, not the VPS. Rebuild/redeploy with the production API URL
+before attempting real-account login.
+
+A fresh local frontend production build passed with
+`VITE_TELEGRAM_SERVICE_URL=https://tg.getaipilot.in`. Its built dashboard includes
+attempt-ID handling and refresh recovery. This build has not been published.
+
+At the earlier local verification, the backend flag was unset, so durable login
+defaulted off. Its service-role
 and encryption settings still need configuration. The local frontend points to
 `http://127.0.0.1:8000`, where no backend was running during verification.
 
-Next, configure backend-only secrets, install the shared package, and deploy
-the compatible backend/frontend according to `DURABLE_LOGIN.md`. Verify the
+Next, deploy the compatible frontend and confirm backend-only secrets, the
+shared package installation, and single-worker configuration according to
+`DURABLE_LOGIN.md`. Verify the
 enabled flow using a controlled Telegram account before enabling it for users.
 Real OTP delivery, Telegram code expiry, two-step password verification, and
 remote logout remain unverified against Telegram itself. Keep one backend worker

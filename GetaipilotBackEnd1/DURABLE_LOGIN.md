@@ -100,6 +100,17 @@ Apply additive migrations, install the shared package, deploy the compatible
 frontend/backend with the flag off, then enable on staging and verify. Enable
 production only after real account checks and secure key configuration.
 
+For a frontend deployed by uploading a locally built `dist` folder, build from
+`bot-dashboard/getaipilot.in` with the production API URL explicitly set:
+
+```sh
+VITE_TELEGRAM_SERVICE_URL=https://tg.getaipilot.in npm run build
+```
+
+Upload that build's `dist` contents, including its new hashed assets. A local
+`.env` containing `http://127.0.0.1:8000` otherwise embeds localhost in the bundle.
+Changing backend environment variables does not change the compiled frontend.
+
 Do not blindly turn the flag off after encrypted credentials are written:
 new-mode metadata contains no plaintext session string. Roll back with the
 new reader retained or stop the backend and deliberately migrate credentials

@@ -1,6 +1,11 @@
 # Telegram session storage and login implementation plan
 
-Status: foundations and Submanager durable login implemented locally; no production migration performed.
+Status: foundation and Submanager migrations applied by the user; compatible
+Submanager backend/frontend deployed. User confirmed login and refresh work;
+two-step password and logout verification remain pending.
+AutoForward secure website login, durable attempts, fenced database sessions,
+checkpoints, delivery recovery and verified migration tooling are implemented and
+locally tested. AutoForward production rollout remains pending.
 Date: 2026-10-03
 
 ## Guided milestones
@@ -9,14 +14,16 @@ Date: 2026-10-03
    offline encryption tests, and disposable-database schema checks. Local
    implementation now exists under `telegram_common/`. The migration and
    rollback-only assertions pass on an isolated PostgreSQL 16 test database.
-   No production tables were changed.
+   The user subsequently applied the foundation migration to main Supabase.
 2. **Submanager:** durable login attempts, authenticated attempt endpoints,
    local integration checks, and legacy conversion. Implemented behind the
    disabled-by-default `TELEGRAM_DURABLE_LOGIN` flag. PostgreSQL and FastAPI
    tests use fake Telegram clients; controlled real-account and staging
    Supabase verification remain required. See `GetaipilotBackEnd1/DURABLE_LOGIN.md`.
 3. **AutoForward:** secure website login and verified per-user migration with
-   a brief worker pause. Preserve old files for a bounded rollback window.
+   a brief worker pause. Implementation and local checks are complete; see
+   `GetAiPilot_autoforwarding_bot/SESSION_MIGRATION.md`. Preserve old files for
+   a bounded rollback window.
 4. **Bot runners:** session migration and update recovery for Join/Tracker,
    AI, Broadcast, and the AutoForward command bot. Bot tokens remain a
    separate credential type; do not put tokens into session-string columns.
@@ -69,21 +76,7 @@ migration directory:
 - `tg_login_attempts`: random attempt ID, verified owner, purpose, encrypted
   pending session and phone/code hash, step, generation, expiry, timestamps,
   and claim/version fields. No stored OTP or two-step password. One active
-  attempt per owner a
-   StringSes1. Start obtains an exclusive claim, normalizes the phone, creates a
-sion client, and requests the code.
-2. Persist the pending session/auth key together with the returned
-   `phone_code_hash`, phone, generation, and expected step before acknowledging
-   success. If persistence fails, return a storage error, never `otp_sent`.
-3. OTP reconstructs the same pending session under its claim and uses the
-   matching hash. A local lock alone is insufficient across processes.
-4. A password-required response advances the attempt and persists any changed
-   session state before releasing the claim. Passwords exist only for the
-   verification call and are never persisted.
-5. Success verifies the Telegram identity, encrypts and saves the credential,
-   and consumes the attempt atomically in a database transaction/RPC. Dashboard
-   metadata synchronization is idempotent and retryable; it must not report
-   successful Telegram authentication as an invnd purpose; replacing an attempt invalidates the old one.
+  attempt per owner and purpose; replacing an attempt invalidates the old one.
 - `tg_session_leases`: credential/attempt ID, worker ID, monotonically
   increasing fencing token, lease expiry. Claims and renewals run atomically
   through restricted database functions.
@@ -106,7 +99,17 @@ numbers, or raw database payloads containing secrets.
 Implement start, OTP, password, cancel, and restart against explicit attempt
 IDs. Bind each attempt to the authenticated owner and service purpose; an ID
 alone grants no access.
-alid OTP.
+
+1. Start obtains an exclusive claim, normalizes the phone and requests the code.
+2. Save the pending auth session, phone and returned `phone_code_hash` before
+   acknowledging `otp_sent`. Persistence failure returns a storage error.
+3. OTP restores that session and matching hash under an atomic claim. A local
+   lock alone is insufficient across processes.
+4. A password-required response persists the new step and updated session before
+   releasing the claim. Passwords exist only for the verification call.
+5. Success verifies identity and atomically saves the encrypted credential while
+   consuming the attempt. Metadata synchronization is separately retryable and
+   must not misreport successful authentication as an invalid OTP.
 6. Expired Telegram codes end the attempt and show a fresh-code action. Invalid
    codes allow a bounded retry. Flood-wait responses show the real retry delay.
 

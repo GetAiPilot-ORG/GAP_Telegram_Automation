@@ -40,7 +40,9 @@ def canonical_id(value):
 
 
 def attempt_context(row):
-    return SessionContext(row["id"], "user", "submanager_login", dashboard_owner_id=row["dashboard_owner_id"])
+    purpose = row.get("purpose", "submanager")
+    return SessionContext(row["id"], "user", purpose + "_login", dashboard_owner_id=row["dashboard_owner_id"],
+                          telegram_owner_id=row.get("telegram_owner_id"))
 
 
 def credential_context(row):
@@ -53,8 +55,11 @@ def credential_context(row):
 
 
 class SupabaseLoginStore:
-    def __init__(self, client):
+    def __init__(self, client, purpose="submanager"):
+        if purpose not in ("submanager", "autoforward"):
+            raise ValueError("Unsupported login purpose")
         self.client = client
+        self.purpose = purpose
 
     async def _execute(self, operation):
         try:
@@ -65,19 +70,31 @@ class SupabaseLoginStore:
             for marker, mapped in _STORE_ERRORS.items():
                 if marker in message:
                     raise LoginError(**vars(mapped)) from None
+            if "TG_LINK_" in message:
+                raise LoginError("link_invalid", "Request a new login link in the bot.", 400, True) from None
+            if "TG_LEASE_LOST" in message or "TG_CREDENTIAL_UNAVAILABLE" in message:
+                raise LoginError("lease_lost", "Forwarding connection is unavailable. Please retry.", 409) from None
+            if "TG_IDENTITY_INVALID" in message:
+                raise LoginError("identity_mismatch", "Telegram account does not match the linked account.", 409, True) from None
             raise LoginError("storage_unavailable", "Unable to save or restore Telegram login. Please retry.", 503) from None
 
     async def rpc(self, name, params):
+        if self.purpose == "autoforward":
+            if name.startswith("tg_login_"):
+                name = name.replace("tg_login_", "tg_autoforward_login_", 1)
+            elif name == "tg_submanager_revoke":
+                name = "tg_autoforward_revoke"
         return await self._execute(lambda: self.client.rpc(name, params).execute().data)
 
     async def credential(self, owner):
         result = await self._execute(lambda: self.client.table("tg_session_credentials")
             .select("*").eq("dashboard_owner_id", canonical_id(owner))
-            .eq("principal_kind", "user").eq("purpose", "submanager").maybe_single().execute())
+            .eq("principal_kind", "user").eq("purpose", self.purpose).maybe_single().execute())
         return result.data if result else None
 
     async def attempt(self, owner, attempt_id):
-        result = await self._execute(lambda: self.client.table("tg_login_attempts")
+        table = "tg_login_attempts" if self.purpose == "submanager" else "tg_autoforward_login_attempts"
+        result = await self._execute(lambda: self.client.table(table)
             .select("*").eq("dashboard_owner_id", canonical_id(owner))
             .eq("id", canonical_id(attempt_id)).maybe_single().execute())
         return result.data if result else None
@@ -95,13 +112,16 @@ class DurableLogin:
     Completed-session worker ownership remains a separate rollout requirement.
     """
 
-    def __init__(self, store, encryption: SessionEncryption, client_factory, timeout=45):
+    def __init__(self, store, encryption: SessionEncryption, client_factory, timeout=45, purpose="submanager"):
         if not 0 < timeout <= 45:
             raise ValueError("Login operations must finish within 45 seconds")
         self.store = store
         self.encryption = encryption
         self.client_factory = client_factory
         self.timeout = timeout
+        if purpose not in ("submanager", "autoforward"):
+            raise ValueError("Unsupported login purpose")
+        self.purpose = purpose
 
     async def _disconnect(self, client):
         try:
@@ -132,7 +152,7 @@ class DurableLogin:
             "p_failed": failed, "p_wait": wait,
         })
 
-    async def start(self, owner, phone):
+    async def start(self, owner, phone, link_id=None):
         owner = canonical_id(owner)
         phone = re.sub(r"[\s()-]", "", phone)
         if not re.fullmatch(r"\+[1-9]\d{5,14}", phone):
@@ -140,9 +160,12 @@ class DurableLogin:
         try:
             async with asyncio.timeout(self.timeout):
                 claim = str(uuid4())
-                row = await self.store.rpc("tg_login_begin", {
+                params = {
                     "p_owner": owner, "p_attempt": str(uuid4()), "p_claim": claim,
-                })
+                }
+                if self.purpose == "autoforward":
+                    params["p_link"] = canonical_id(link_id)
+                row = await self.store.rpc("tg_login_begin", params)
                 client = self.client_factory("")
                 failure = None
                 state = None
@@ -202,7 +225,8 @@ class DurableLogin:
                     identity = await client.get_me()
                     if (not identity or getattr(identity, "bot", False)
                         or not getattr(identity, "phone", None)
-                        or "+" + identity.phone != state["phone"]):
+                        or "+" + identity.phone != state["phone"]
+                        or (self.purpose == "autoforward" and identity.id != row["telegram_owner_id"])):
                         raise LoginError("identity_mismatch", "Telegram account did not match this login.", 409, True)
                 except errors.SessionPasswordNeededError:
                     next_step = "password"
@@ -224,7 +248,8 @@ class DurableLogin:
                     await self._disconnect(client)
                 state["session"] = StringSession.save(client.session)
                 if identity and not failure:
-                    context = SessionContext(row["credential_id"], "user", "submanager", dashboard_owner_id=owner)
+                    context = SessionContext(row["credential_id"], "user", self.purpose, dashboard_owner_id=owner,
+                                             telegram_owner_id=row.get("telegram_owner_id"))
                     await self.store.rpc("tg_login_complete", {
                         "p_owner": owner, "p_attempt": attempt_id, "p_claim": claim,
                         "p_session": self.encryption.encrypt(state["session"], context),

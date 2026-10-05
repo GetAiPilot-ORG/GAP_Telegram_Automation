@@ -10,7 +10,7 @@ except Exception:
 from typing import Dict, List, Tuple, Set, Any, Optional
 
 from dotenv import load_dotenv
-from supabase import create_client, Client
+from supabase import create_client, Client, ClientOptions
 
 from telethon import TelegramClient, events, errors, Button
 from telethon.tl import functions
@@ -58,17 +58,52 @@ if not (SUPABASE_URL and SUPABASE_KEY):
 os.makedirs(SESSION_DIR, exist_ok=True)
 
 try:
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY, options=ClientOptions(postgrest_client_timeout=8))
 except Exception as ex:
     print(f"❌ Failed to initialize Supabase client: {ex}")
     raise
 
+# Opt-in cutover; keep one command-bot update-ingestion process.
+AUTOFORWARD_WEB_LOGIN = os.getenv("AUTOFORWARD_WEB_LOGIN", "false").lower() == "true"
+AUTOFORWARD_DATABASE_SESSIONS = os.getenv("AUTOFORWARD_DATABASE_SESSIONS", "false").lower() == "true"
+if AUTOFORWARD_WEB_LOGIN and not AUTOFORWARD_DATABASE_SESSIONS:
+    raise RuntimeError("AutoForward web login requires database sessions")
+DATABASE_CLIENTS = None
+WEB_LINKS = None
+WEB_LOGIN = None
+if AUTOFORWARD_DATABASE_SESSIONS:
+    from telegram_common import SessionEncryption
+    from telegram_common.autoforward import AutoForwardClients, AutoForwardLogin, AutoForwardStore
+    from telegram_common.login import LoginError
+    from telegram_common.login_links import AutoForwardLoginLinks, SupabaseLinkStore
+    if not os.getenv("SUPABASE_SERVICE_ROLE_KEY"):
+        raise RuntimeError("AutoForward database sessions require a backend service-role key")
+    session_cipher = SessionEncryption.from_environment()
+    session_store = AutoForwardStore(supabase)
+    def on_database_owner_loss(uid):
+        forward_loops.pop(uid, None)
+        USER_CLIENT_CACHE.pop(uid, None)
+    DATABASE_CLIENTS = AutoForwardClients(session_store, session_cipher, API_ID, API_HASH, on_loss=on_database_owner_loss)
+    WEB_LINKS = AutoForwardLoginLinks(SupabaseLinkStore(supabase), os.getenv("AUTOFORWARD_LOGIN_URL", "https://getaipilot.in/autoforward/login"))
+    WEB_LOGIN = AutoForwardLogin(session_store, session_cipher, API_ID, API_HASH)
+USER_CLIENT_LOCKS = {}
+USER_FORWARD_LOCKS = {}
+USER_EVENT_LOCKS = {}
+EXPLICIT_PAUSED_USERS = set()
+
+# Validate database configuration before opening the command-bot connection.
 bot_session_path = os.path.join(SCRIPT_DIR, "login_bot_runner")
 try:
     asyncio.get_event_loop()
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 bot = TelegramClient(bot_session_path, API_ID, API_HASH).start(bot_token=BOT_TOKEN)
+
+def serialize_user_operation(handler):
+    async def serialized(event):
+        async with USER_FORWARD_LOCKS.setdefault(event.sender_id, asyncio.Lock()):
+            return await handler(event)
+    return serialized
 
 PHONE_RE = re.compile(r"^\+\d{6,15}$", re.IGNORECASE)
 OTP_RE   = re.compile(r"^(?:LOGIN\s*)?(\d{4,8})$", re.IGNORECASE)  # 123456 or LOGIN123456
@@ -812,6 +847,27 @@ def session_path(uid: int, phone: str) -> str:
 
 
 async def get_user_client(uid: int) -> TelegramClient:
+    async with USER_CLIENT_LOCKS.setdefault(uid, asyncio.Lock()):
+        if DATABASE_CLIENTS is not None:
+            row = await session_store.telegram_credential(uid)
+            if row is not None:
+                old_client = USER_CLIENT_CACHE.get(uid)
+                if old_client is not None and not getattr(old_client, "owner_manager", None):
+                    await old_client.disconnect()
+                    USER_CLIENT_CACHE.pop(uid, None)
+                    forward_loops.pop(uid, None)
+                if row["state"] != "active":
+                    cached = USER_CLIENT_CACHE.pop(uid, None)
+                    if cached:
+                        await cached.disconnect()
+                    raise RuntimeError("Telegram credential needs login or logout recovery")
+                client = await DATABASE_CLIENTS.get(uid)
+                USER_CLIENT_CACHE[uid] = client
+                return client
+        return await _get_legacy_user_client(uid)
+
+
+async def _get_legacy_user_client(uid: int) -> TelegramClient:
     """
     SAME user ke liye SAME TelegramClient reuse karega.
     Isse ek hi .session file ko multiple clients access nahi karenge.
@@ -836,12 +892,12 @@ async def get_user_client(uid: int) -> TelegramClient:
             # Agar reconnect bhi fail ho gaya → is client ko hata do
             try:
                 await client.disconnect()
-            except:
+            except Exception:
                 pass
             USER_CLIENT_CACHE.pop(uid, None)
 
     # 2️⃣ Agar cache me valid client nahi mila → DB se session file lo
-    sess = sp_get_session(uid)
+    sess = await asyncio.to_thread(sp_get_session, uid)
     if not sess:
         raise RuntimeError("No saved session. Use /login first.")
 
@@ -938,7 +994,7 @@ async def guard_or_hint(e) -> bool:
         return True
 
     # If user has an active dashboard subscription, allow
-    sub = get_active_subscription(uid)
+    sub = await asyncio.to_thread(get_active_subscription, uid)
     if sub:
         return True
 
@@ -1083,7 +1139,7 @@ async def premium_or_hint(e) -> bool:
     required_level = PLAN_LEVEL[required_plan]
 
     # user ka plan
-    user_plan, user_level = get_user_plan_level(int(e.sender_id))
+    user_plan, user_level = await asyncio.to_thread(get_user_plan_level, int(e.sender_id))
 
     # agar allowed → continue
     if user_level >= required_level:
@@ -1134,7 +1190,7 @@ async def start_cmd(e):
 
     # ✅ Deep link /start <uuid> → map telegram_user_id + show plan block
     linked_msg = ""
-    ok = sp_link_telegram_to_app_user(payload, uid_tg)
+    ok = await asyncio.to_thread(sp_link_telegram_to_app_user, payload, uid_tg)
 
     if not ok:
         msg = (
@@ -1145,9 +1201,9 @@ async def start_cmd(e):
         return await e.respond(msg, parse_mode="md")
 
     # only fetch subscription if link succeeded
-    app_sub = sp_get_app_subscription_by_user_id(payload)
+    app_sub = await asyncio.to_thread(sp_get_app_subscription_by_user_id, payload)
     if not app_sub:
-        app_sub = sp_get_app_subscription_by_telegram_user_id(uid_tg)
+        app_sub = await asyncio.to_thread(sp_get_app_subscription_by_telegram_user_id, uid_tg)
 
     linked_msg = "✅ Dashboard account linked successfully!\n\n"
 
@@ -1164,7 +1220,7 @@ async def cmd_start_demo(e):
     uid_tg = int(e.sender_id)
 
     # --- Subscription status at top ---
-    app_sub = sp_get_app_subscription_by_telegram_user_id(uid_tg)
+    app_sub = await asyncio.to_thread(sp_get_app_subscription_by_telegram_user_id, uid_tg)
     status_block = format_app_plan_block(app_sub)
 
     txt = (
@@ -1247,7 +1303,11 @@ async def cb_help_back(event):
 
 @bot.on(events.NewMessage(pattern=r"^/status$"))
 async def status_cmd(e):
-    data = sp_get_session(e.sender_id)
+    if DATABASE_CLIENTS is not None:
+        row = await session_store.telegram_credential(e.sender_id)
+        if row is not None:
+            return await e.respond("🟢 Logged in. Use /incoming, /outgoing and /work." if row["state"] == "active" else "🟠 Telegram requires login or logout recovery. Use /login or retry /logout.")
+    data = await asyncio.to_thread(sp_get_session, e.sender_id)
     if not data:
         return await e.respond("🔴 Not logged in. Use **/login** to connect your account.", parse_mode="md")
     if not await is_logged_in(e.sender_id):
@@ -1258,6 +1318,26 @@ async def status_cmd(e):
 @bot.on(events.NewMessage(pattern=r"^/login$"))
 async def login_cmd(e):
     uid = e.sender_id
+    if AUTOFORWARD_WEB_LOGIN:
+        if not e.is_private:
+            return await e.respond("Open a private chat with this bot to login.")
+        login_state.pop(uid, None)
+        if await is_logged_in(uid):
+            return await e.respond("Telegram is already connected. Use /incoming, /outgoing and /work. To change the login, disconnect with /logout first.")
+        try:
+            link = await WEB_LINKS.issue(uid)
+            msg_text = (
+                "🔐 **Connect Telegram Securely**\n\n"
+                "Sign in to your dashboard, then open this secure link:\n"
+                f"{link['url']}\n\n"
+                "⏳ _The link expires in five minutes._"
+            )
+            try:
+                return await e.respond(msg_text, buttons=[[Button.url("Connect Telegram securely", link["url"])]], parse_mode="md")
+            except Exception:
+                return await e.respond(msg_text, parse_mode="md")
+        except LoginError as error:
+            return await e.respond(error.message)
     if await is_logged_in(uid):
         return await e.respond(
             "✅ **Already logged in.**\n"
@@ -1271,6 +1351,8 @@ async def login_cmd(e):
 
 @bot.on(events.NewMessage)
 async def login_flow(e):
+    if AUTOFORWARD_WEB_LOGIN:
+        return
     uid = e.sender_id
     msg = (e.raw_text or "").strip()
     if uid not in login_state:
@@ -1289,7 +1371,7 @@ async def login_flow(e):
             await client.connect()
             if await client.is_user_authorized():
                 me = await client.get_me()
-                sp_upsert_session(uid, phone, os.path.basename(local))
+                await asyncio.to_thread(sp_upsert_session, uid, phone, os.path.basename(local))
                 await e.respond(f"✅ Already logged in as **{me.first_name}**.\nStart forwarding with **/work**.")
                 login_state.pop(uid, None)
                 return
@@ -1332,7 +1414,7 @@ async def login_flow(e):
             try:
                 await client.sign_in(phone, otp, phone_code_hash=code_hash)
                 me = await client.get_me()
-                sp_upsert_session(uid, phone, os.path.basename(local))
+                await asyncio.to_thread(sp_upsert_session, uid, phone, os.path.basename(local))
                 await e.respond(
                     f"✅ Logged in as **{me.first_name}**.\n"
                     "Now set **/incoming** & **/outgoing**, then **/work** to start."
@@ -1377,7 +1459,7 @@ async def login_flow(e):
             await client.connect()
             await client.sign_in(password=password)
             me = await client.get_me()
-            sp_upsert_session(uid, phone, os.path.basename(local))
+            await asyncio.to_thread(sp_upsert_session, uid, phone, os.path.basename(local))
             await e.respond(
                 f"✅ 2FA verified. Logged in as **{me.first_name}**.\n"
                 "Start forwarding with **/incoming** & **/outgoing**, then **/work**."
@@ -1394,7 +1476,7 @@ async def login_flow(e):
         return
 
 # ---------------- PREMIUM-GATED COMMANDS ----------------
-@bot.on(events.NewMessage(pattern=r"^/incoming$"))
+@bot.on(events.NewMessage(pattern=r"^/incoming(?:@\w+)?(?:\s+.*)?$"))
 async def incoming_cmd(e):
     if not await guard_or_hint(e): return
     if not await premium_or_hint(e): return
@@ -1405,7 +1487,7 @@ async def incoming_cmd(e):
         buttons=[Button.inline("📌 I have pinned the chats", data=b"pin_incoming")]
     )
 
-@bot.on(events.NewMessage(pattern=r"^/outgoing$"))
+@bot.on(events.NewMessage(pattern=r"^/outgoing(?:@\w+)?(?:\s+.*)?$"))
 async def outgoing_cmd(e):
     if not await guard_or_hint(e): return
     if not await premium_or_hint(e): return
@@ -1420,6 +1502,7 @@ async def outgoing_cmd(e):
 async def cb_incoming(event):
     uid = event.sender_id
     try:
+        await event.answer()
         uc = await get_user_client(uid)
     except Exception:
         return await event.answer("Please login first using /login", alert=True)
@@ -1427,7 +1510,7 @@ async def cb_incoming(event):
     pairs = await top_dialog_pairs(uc, TOP_N)
 
     # 🔹 Fetch already saved incoming chats (sources) from the database
-    existing_mapping = sp_load_mapping(uid)  # sender_id -> [receivers]
+    existing_mapping = await asyncio.to_thread(sp_load_mapping, uid)  # sender_id -> [receivers]
     existing_sources = set(int(sid) for sid in existing_mapping.keys())
 
     # 🔹 Pre-select chats that are already saved as incoming (show with a checkmark)
@@ -1444,18 +1527,24 @@ async def cb_incoming(event):
         "outgoing_ids": [],
     }
 
-    await event.edit(
-        "📥 Select **INCOMING** chats (multi-select).\n"
-        "Chats that are already saved will appear with a ✅ checkmark.\n"
-        "Tap the numbers to toggle selection, then press **Done**.\n\n"
-        + numbered_list_from_pairs(pairs),
-        buttons=multi_kb(len(pairs), pre_selected),
-    )
+    try:
+        await event.edit(
+            "📥 Select **INCOMING** chats (multi-select).\n"
+            "Chats that are already saved will appear with a ✅ checkmark.\n"
+            "Tap the numbers to toggle selection, then press **Done**.\n\n"
+            + numbered_list_from_pairs(pairs),
+            buttons=multi_kb(len(pairs), pre_selected),
+        )
+    except errors.MessageNotModifiedError:
+        pass
+    except Exception as ex:
+        print(f"cb_incoming edit error: {ex}")
 
 @bot.on(events.CallbackQuery(pattern=b"^pin_outgoing$"))
 async def cb_outgoing(event):
     uid = event.sender_id
     try:
+        await event.answer()
         uc = await get_user_client(uid)
     except Exception:
         return await event.answer("Please login first using /login", alert=True)
@@ -1464,7 +1553,7 @@ async def cb_outgoing(event):
     st = select_state.get(uid, {"incoming_ids": [], "outgoing_ids": []})
 
     # 🔹 Fetch already saved outgoing chats (targets) from the database
-    existing_mapping = sp_load_mapping(uid)
+    existing_mapping = await asyncio.to_thread(sp_load_mapping, uid)
     existing_targets: Set[int] = set()
     for _src, tgt_list in existing_mapping.items():
         for t in tgt_list or []:
@@ -1484,13 +1573,18 @@ async def cb_outgoing(event):
         "outgoing_ids": [],
     }
 
-    await event.edit(
-        "📤 Select **OUTGOING** chats (multi-select).\n"
-        "Chats that are already saved will appear with a ✅ checkmark.\n"
-        "Tap the numbers to toggle selection, then press **Done**.\n\n"
-        + numbered_list_from_pairs(pairs),
-        buttons=multi_kb(len(pairs), pre_selected),
-    )
+    try:
+        await event.edit(
+            "📤 Select **OUTGOING** chats (multi-select).\n"
+            "Chats that are already saved will appear with a ✅ checkmark.\n"
+            "Tap the numbers to toggle selection, then press **Done**.\n\n"
+            + numbered_list_from_pairs(pairs),
+            buttons=multi_kb(len(pairs), pre_selected),
+        )
+    except errors.MessageNotModifiedError:
+        pass
+    except Exception as ex:
+        print(f"cb_outgoing edit error: {ex}")
 
 @bot.on(events.CallbackQuery(pattern=b"^msel:"))
 async def cb_toggle(event):
@@ -1515,19 +1609,28 @@ async def cb_toggle(event):
     elif st["mode"] == "remove_out": header = "❌ Select **OUTGOING targets** to remove"
     elif st["mode"] == "remove_filter": header = "🗑️ Select **filters** to remove"
     elif st["mode"] == "remove_blacklist": header = "🗑️ Select **blacklisted words** to remove"
-
     else: header = "Select items"
 
-    await event.edit(
-        f"{header} (multi-select). Numbers toggle, then **Done**.\n\n"
-        + numbered_list_from_pairs(st["pairs"]),
-        buttons=multi_kb(len(st["pairs"]), sel),
-    )
+    try:
+        await event.answer()
+        await event.edit(
+            f"{header} (multi-select). Numbers toggle, then **Done**.\n\n"
+            + numbered_list_from_pairs(st["pairs"]),
+            buttons=multi_kb(len(st["pairs"]), sel),
+        )
+    except errors.MessageNotModifiedError:
+        pass
+    except Exception as ex:
+        print(f"cb_toggle edit warning: {ex}")
 
 # ---------------- MULTI-SELECT DONE HANDLER (with remove_blacklist) ----------------
 @bot.on(events.CallbackQuery(pattern=b"^msel_done$"))
 async def cb_msel_done(event):
     uid = event.sender_id
+    try:
+        await event.answer()
+    except Exception:
+        pass
     st = select_state.get(uid)
     if not st:
         return await event.answer("Session expired. Start again.", alert=True)
@@ -1542,10 +1645,10 @@ async def cb_msel_done(event):
                 fn = (rows[i].get("from_name") or "").strip()
                 if fn:
                     to_remove.append(fn)
-        removed = sp_delete_filters_batch(uid, to_remove)
+        removed = await asyncio.to_thread(sp_delete_filters_batch, uid, to_remove)
         select_state.pop(uid, None)
         if uid in forward_loops:
-            forward_loops[uid]["filters"] = compile_filters_for_user(uid)
+            forward_loops[uid]["filters"] = await asyncio.to_thread(compile_filters_for_user, uid)
         pretty = "\n".join([f"- `{x}`" for x in to_remove]) or "(none)"
         return await event.edit(f"✅ Removed **{removed}** filter(s):\n{pretty}", buttons=None)
 
@@ -1559,10 +1662,10 @@ async def cb_msel_done(event):
                 w = (rows[i].get("word") or "").strip()
                 if w:
                     to_remove.append(w)
-        removed = sp_delete_blacklist_batch(uid, to_remove)
+        removed = await asyncio.to_thread(sp_delete_blacklist_batch, uid, to_remove)
         select_state.pop(uid, None)
         if uid in forward_loops:
-            forward_loops[uid]["blacklist"] = compile_blacklist_for_user(uid)
+            forward_loops[uid]["blacklist"] = await asyncio.to_thread(compile_blacklist_for_user, uid)
         pretty = "\n".join([f"- `{x}`" for x in to_remove]) or "(none)"
         return await event.edit(f"✅ Removed **{removed}** blacklisted word(s):\n{pretty}", buttons=None)
 
@@ -1581,18 +1684,22 @@ async def cb_msel_done(event):
         return await event.edit("✅ **Outgoing set!**\n\nStart with **/work**.", buttons=None)
 
     elif st["mode"] == "remove_in":
-        sp_delete_senders(uid, chosen_ids)
+        await asyncio.to_thread(sp_delete_senders, uid, chosen_ids)
         select_state.pop(uid, None)
         return await event.edit("✅ Selected **incoming sources** removed.", buttons=None)
 
     elif st["mode"] == "remove_out":
-        sp_remove_targets_globally(uid, chosen_ids)
+        await asyncio.to_thread(sp_remove_targets_globally, uid, chosen_ids)
         select_state.pop(uid, None)
         return await event.edit("✅ Selected **outgoing targets** removed from all mappings.", buttons=None)
 
 
 @bot.on(events.CallbackQuery(pattern=b"^msel_cancel$"))
 async def cb_cancel(event):
+    try:
+        await event.answer()
+    except Exception:
+        pass
     select_state.pop(event.sender_id, None)
     await event.edit("✖ Cancelled. Use **/incoming** or **/outgoing** again.")
 
@@ -1601,7 +1708,7 @@ async def remove_incoming_cmd(e):
     if not await guard_or_hint(e): return
     if not await premium_or_hint(e): return
     uid = e.sender_id
-    mapping = sp_load_mapping(uid)
+    mapping = await asyncio.to_thread(sp_load_mapping, uid)
     senders = list(mapping.keys())
     if not senders:
         return await e.respond("ℹ️ No incoming sources saved.")
@@ -1625,7 +1732,7 @@ async def remove_outgoing_cmd(e):
     if not await guard_or_hint(e): return
     if not await premium_or_hint(e): return
     uid = e.sender_id
-    mapping = sp_load_mapping(uid)
+    mapping = await asyncio.to_thread(sp_load_mapping, uid)
     all_targets: List[int] = sorted({int(t) for lst in mapping.values() for t in lst})
     if not all_targets:
         return await e.respond("ℹ️ No outgoing targets saved.")
@@ -1652,7 +1759,7 @@ async def cmd_config(e):
 
     uid = e.sender_id
     uid_tg = int(e.sender_id)  # ✅ FIX ADDED
-    mapping = sp_load_mapping(uid)
+    mapping = await asyncio.to_thread(sp_load_mapping, uid)
     if not mapping:
         return await e.respond("ℹ️ No configuration yet. First set **/incoming** & **/outgoing**.")
 
@@ -1701,7 +1808,7 @@ async def cmd_config(e):
 
 
     # --- Filters (text replacements) ---
-    filters = sp_list_filters(uid)
+    filters = await asyncio.to_thread(sp_list_filters, uid)
     lines.append("**Filters (text replacements):**")
     if not filters:
         lines.append("(none)")
@@ -1711,12 +1818,12 @@ async def cmd_config(e):
     lines.append("")
 
     # --- Delay ---
-    delay = sp_get_delay(uid) or 0
+    delay = await asyncio.to_thread(sp_get_delay, uid) or 0
     lines.append(f"**Delay between forwards:** `{delay}s`")
     lines.append("")
 
     # --- Start/End text ---
-    addons = sp_get_text_addons(uid)
+    addons = await asyncio.to_thread(sp_get_text_addons, uid)
     st = (addons.get('start_text') or "").strip()
     et = (addons.get('end_text') or "").strip()
 
@@ -1729,7 +1836,7 @@ async def cmd_config(e):
     lines.append("")
 
     # --- Blacklisted words ---
-    bl = sp_list_blacklist(uid)
+    bl = await asyncio.to_thread(sp_list_blacklist, uid)
     lines.append("**Blacklisted words:**")
     if not bl:
         lines.append("(none)")
@@ -1739,8 +1846,8 @@ async def cmd_config(e):
     lines.append("")
 
     # --- Subscription info ---
-    sub = sp_get_app_subscription_by_telegram_user_id(uid_tg)
-    if sub and sp_is_sub_active(sub):
+    sub = await asyncio.to_thread(sp_get_app_subscription_by_telegram_user_id, uid_tg)
+    if sub and await asyncio.to_thread(sp_is_sub_active, sub):
         try:
             exp_utc = datetime.fromisoformat(str(sub["expires_at"]).replace("Z", "+00:00"))
             exp_ist = exp_utc.astimezone(IST)
@@ -1770,7 +1877,8 @@ async def cmd_config(e):
 
     await e.respond("\n".join(lines), parse_mode="md")
     # new edti today 09/12/2025
-@bot.on(events.NewMessage(pattern=r"^/work$"))
+@bot.on(events.NewMessage(pattern=r"^/work(?:@\w+)?(?:\s+.*)?$"))
+@serialize_user_operation
 async def cmd_work(e):
     # Premium + login checks
     if not await guard_or_hint(e):
@@ -1779,6 +1887,8 @@ async def cmd_work(e):
         return
 
     uid = e.sender_id
+    was_paused = uid in EXPLICIT_PAUSED_USERS
+    EXPLICIT_PAUSED_USERS.discard(uid)
 
     # 🔴 If a forwarding loop is already running, stop it and disconnect the client
     old_state = forward_loops.pop(uid, None)
@@ -1788,14 +1898,14 @@ async def cmd_work(e):
             # Remove previous event handlers
             try:
                 old_client.remove_event_handlers()
-            except:
+            except Exception:
                 pass
             # Force disconnect
             try:
                 await old_client.disconnect()
-            except:
+            except Exception:
                 pass
-        except:
+        except Exception:
             pass
         # Remove from cache as well
         USER_CLIENT_CACHE.pop(uid, None)
@@ -1806,7 +1916,7 @@ async def cmd_work(e):
     out: List[int] = st.get("outgoing_ids", []) or []
 
     # Load current mapping from DB
-    mapping_db = sp_load_mapping(uid)  # {sender_id: [receivers]}
+    mapping_db = await asyncio.to_thread(sp_load_mapping, uid)  # {sender_id: [receivers]}
     mapping: Dict[int, List[int]] = {int(k): list(v or []) for k, v in mapping_db.items()}
 
     existing_senders: Set[int] = set(mapping.keys())
@@ -1883,7 +1993,7 @@ async def cmd_work(e):
         except Exception:
             receivers_names = [f"id:{int(x)}" for x in receivers]
 
-        sp_upsert_mapping(
+        await asyncio.to_thread(sp_upsert_mapping,
             uid,
             int(s),
             [int(x) for x in receivers],
@@ -1892,17 +2002,17 @@ async def cmd_work(e):
         )
 
     # Reload mapping (safety)
-    mapping = sp_load_mapping(uid)
+    mapping = await asyncio.to_thread(sp_load_mapping, uid)
     if not mapping:
         return await e.respond("⚠️ Failed to save configuration. Please try again later.")
 
     # Load filters, blacklist, delay and cache them
-    compiled_filters = compile_filters_for_user(uid)
-    user_blacklist   = compile_blacklist_for_user(uid)
-    user_delay       = sp_get_delay(uid) or 0
+    compiled_filters = await asyncio.to_thread(compile_filters_for_user, uid)
+    user_blacklist   = await asyncio.to_thread(compile_blacklist_for_user, uid)
+    user_delay       = await asyncio.to_thread(sp_get_delay, uid) or 0
 
     # Load start/end text add-ons
-    addons_row = sp_get_text_addons(uid)
+    addons_row = await asyncio.to_thread(sp_get_text_addons, uid)
     start_addon = (addons_row.get("start_text") or "").strip()
     end_addon   = (addons_row.get("end_text") or "").strip()
 
@@ -1917,18 +2027,42 @@ async def cmd_work(e):
         "end_text": end_addon,
     }
 
+    if DATABASE_CLIENTS is not None and getattr(uclient, "owner_manager", None):
+        from telegram_common.forward_delivery import initialize_sources, rpc
+        relay = os.getenv("PRIVATE_BROADCAST_RELAY_CHAT_ID") or os.getenv("GAP_PRIVATE_BROADCAST_RELAY_CHAT_ID")
+        uclient.relay_target = int(relay) if relay else None
+        try:
+            previous = await asyncio.to_thread(lambda: supabase.table("tg_user_settings").select("is_forwarding").eq("user_id", uid).limit(1).execute())
+            if was_paused or not (previous.data and previous.data[0].get("is_forwarding")):
+                await rpc(uclient, "tg_autoforward_pause", {})
+            await initialize_sources(uclient, mapping)
+        except Exception as ex:
+            import traceback
+            traceback.print_exc()
+            print(f"❌ Error in /work recovery for user {uid}: {ex}")
+            forward_loops.pop(uid, None)
+            await uclient.disconnect()
+            USER_CLIENT_CACHE.pop(uid, None)
+            return await e.respond("Unable to prepare forwarding recovery. Please retry /work shortly.")
+
     # Attach ONE event handler for this user-client
     @uclient.on(events.NewMessage)
     async def handle_forward(evt):
         await _handle_forward_event(uid, evt)
 
+    if DATABASE_CLIENTS is not None and getattr(uclient, "owner_manager", None):
+        from telegram_common.forward_delivery import recovery_loop
+        uclient.recovery_task = asyncio.create_task(recovery_loop(uclient,
+            lambda: forward_loops.get(uid, {}).get("mapping", {}), lambda evt: _handle_forward_event(uid, evt)))
+        await uclient.catch_up()
+
     # Mark in DB that forwarding is active
     try:
-        supabase.table("tg_user_settings").upsert({
+        await asyncio.to_thread(lambda: supabase.table("tg_user_settings").upsert({
             "user_id": uid,
             "is_forwarding": True,
             "updated_at": datetime.now(timezone.utc).isoformat()
-        }, on_conflict="user_id").execute()
+        }, on_conflict="user_id").execute())
     except Exception as ex:
         print(f"⚠️ Warning updating is_forwarding for user {uid}: {ex}")
 
@@ -1939,6 +2073,30 @@ async def cmd_work(e):
 
 
 async def _handle_forward_event(uid: int, evt):
+    async with USER_EVENT_LOCKS.setdefault(uid, asyncio.Lock()):
+        return await _handle_forward_event_owned(uid, evt)
+
+
+async def _handle_forward_event_owned(uid: int, evt):
+    state = forward_loops.get(uid)
+    client = state.get("client") if state else None
+    if client is not None and getattr(client, "owner_manager", None):
+        from telegram_common.forward_delivery import forwarding_event
+        source = evt.chat_id if evt.chat_id is not None else evt.sender_id
+        if not getattr(evt, "recovery", False) and evt.message.id <= getattr(client, "forward_baselines", {}).get(int(source), 0):
+            return
+        targets = list(state["mapping"].get(int(source), []))
+        if not targets:
+            return
+        relay = os.getenv("PRIVATE_BROADCAST_RELAY_CHAT_ID") or os.getenv("GAP_PRIVATE_BROADCAST_RELAY_CHAT_ID")
+        if relay:
+            targets.append(int(relay))
+        async with forwarding_event(client, source, evt.message.id, targets):
+            return await _forward_event_impl(uid, evt)
+    return await _forward_event_impl(uid, evt)
+
+
+async def _forward_event_impl(uid: int, evt):
     """
     Real forward logic – saare media types yahin handle honge.
     Har user ke liye state `forward_loops[uid]` se lete hain.
@@ -1952,6 +2110,8 @@ async def _handle_forward_event(uid: int, evt):
         if not uclient:
             print(f"⚠️ [FORWARD-WARN] uclient is None for user {uid}")
             return
+        if getattr(uclient, "owner_manager", None):
+            uclient.assert_owned()
         mapping: Dict[int, List[int]] = state["mapping"]
         compiled_now = state.get("filters", [])
         curr_blacklist = state.get("blacklist", [])
@@ -1964,7 +2124,7 @@ async def _handle_forward_event(uid: int, evt):
         #    return
 
         src_id = evt.chat_id if evt.chat_id is not None else evt.sender_id
-        targets = mapping.get(int(src_id))
+        targets = list(dict.fromkeys(mapping.get(int(src_id), [])))
         if not targets:
             return
 
@@ -2133,49 +2293,36 @@ async def _handle_forward_event(uid: int, evt):
     except Exception as ex:
         print("forward handler err:", ex)
     
-@bot.on(events.NewMessage(pattern=r"^/stop$"))
+async def persist_stopped(uid):
+    await asyncio.to_thread(lambda: supabase.table("tg_user_settings").upsert({
+        "user_id": uid, "is_forwarding": False, "updated_at": datetime.now(timezone.utc).isoformat()
+    }, on_conflict="user_id").execute())
+
+
+@bot.on(events.NewMessage(pattern=r"^/stop(?:@\w+)?(?:\s+.*)?$"))
+@serialize_user_operation
 async def cmd_stop(e):
-    if not await guard_or_hint(e):
-        return
-
     uid = e.sender_id
+    EXPLICIT_PAUSED_USERS.add(uid)
     state = forward_loops.pop(uid, None)
-
-    if not state:
-        return await e.respond("⚠️ Forwarding was not running.")
-
-    client = state.get("client")
-
-    # 🔴 Remove all registered event handlers for this user-client
-    try:
-        client.remove_event_handlers()
-    except:
-        pass
-
-    # 🔴 Force-terminate Telethon connection (kills session locks)
-    try:
-        client._sender = None
-    except:
-        pass
-
-    try:
+    client = state.get("client") if state else USER_CLIENT_CACHE.get(uid)
+    if client:
+        if getattr(client, "owner_manager", None):
+            from telegram_common.forward_delivery import rpc
+            try:
+                await rpc(client, "tg_autoforward_pause", {})
+            except Exception:
+                pass  # Persisting stopped intent below is still mandatory.
+        for callback, builder in client.list_event_handlers():
+            client.remove_event_handler(callback, builder)
         await client.disconnect()
-    except:
-        pass
-
-    # 🔥 IMPORTANT: Remove cached client also
     USER_CLIENT_CACHE.pop(uid, None)
-
-    # Mark forwarding as stopped
     try:
-        supabase.table("tg_user_settings").update({
-            "is_forwarding": False,
-            "updated_at": datetime.now(timezone.utc).isoformat()
-        }).eq("user_id", uid).execute()
-    except Exception as ex:
-        print(f"⚠️ Warning updating is_forwarding for user {uid}: {ex}")
+        await persist_stopped(uid)
+    except Exception:
+        return await e.respond("Forwarding connection stopped. Unable to save stopped status; retry /stop before restarting the bot.")
+    await e.respond("Forwarding stopped. Use /work to start again.")
 
-    await e.respond("⏹️ **Forwarding stopped**\nYou can start again with **/work**.")
 
 # ---------------- FILTER COMMANDS (premium) ----------------
 @bot.on(events.NewMessage(pattern=r"^/addfilter$"))
@@ -2211,17 +2358,17 @@ async def addfilter_cmd(e):
         return await e.respond("⚠️ Both values are required: `old==new`.", parse_mode="md")
     if left.lower() == right.lower():
         return await e.respond("⚠️ Left aur right same nahi ho sakte.")
-    ok, msg = sp_add_filter(uid, left, right)
+    ok, msg = await asyncio.to_thread(sp_add_filter, uid, left, right)
     await e.respond(msg)
     if uid in forward_loops:
-        forward_loops[uid]["filters"] = compile_filters_for_user(uid)
+        forward_loops[uid]["filters"] = await asyncio.to_thread(compile_filters_for_user, uid)
 
 @bot.on(events.NewMessage(pattern=r"^/showfilter$"))
 async def showfilter_cmd(e):
     if not await guard_or_hint(e): return
     if not await premium_or_hint(e): return
     uid = e.sender_id
-    rows = sp_list_filters(uid)
+    rows = await asyncio.to_thread(sp_list_filters, uid)
     if not rows:
         return await e.respond("ℹ️ No filters set. Add one: `/addfilter @old==@new`", parse_mode="md")
     lines = ["**Your filters:**", ""]
@@ -2236,7 +2383,7 @@ async def removefilter_ui_cmd(e):
     if not await guard_or_hint(e): return
     if not await premium_or_hint(e): return
     uid = e.sender_id
-    rows = sp_list_filters(uid)
+    rows = await asyncio.to_thread(sp_list_filters, uid)
     if not rows:
         return await e.respond("❌ No filters set yet!\n\nAdd filters with `/addfilter old==new`.", parse_mode="md")
     pairs = [(i, f"{(r.get('from_name') or '')} → {(r.get('to_name') or '')}") for i, r in enumerate(rows)]
@@ -2253,19 +2400,19 @@ async def removefilter_cmd(e):
     if not await premium_or_hint(e): return
     uid = e.sender_id
     left = e.pattern_match.group(1)
-    ok, msg = sp_delete_filter(uid, left)
+    ok, msg = await asyncio.to_thread(sp_delete_filter, uid, left)
     await e.respond(msg)
     if uid in forward_loops:
-        forward_loops[uid]["filters"] = compile_filters_for_user(uid)
+        forward_loops[uid]["filters"] = await asyncio.to_thread(compile_filters_for_user, uid)
 
 @bot.on(events.NewMessage(pattern=r"^/deleteallfilters$"))
 async def delete_all_filters_cmd(e):
     if not await guard_or_hint(e): return
     if not await premium_or_hint(e): return
     uid = e.sender_id
-    n = sp_delete_all_filters(uid)
+    n = await asyncio.to_thread(sp_delete_all_filters, uid)
     if uid in forward_loops:
-        forward_loops[uid]["filters"] = compile_filters_for_user(uid)
+        forward_loops[uid]["filters"] = await asyncio.to_thread(compile_filters_for_user, uid)
     await e.respond(f"🗑️ Deleted **{n}** filter(s). \nStart forwarding with **/work**.")
 
 # ---------------- BLACKLIST COMMANDS (premium) ----------------
@@ -2290,18 +2437,18 @@ async def blacklist_add_cmd(e):
     if not await premium_or_hint(e): return
     uid = e.sender_id
     word = (e.pattern_match.group(1) or "").strip()
-    ok, msg = sp_add_blacklist_word(uid, word)
+    ok, msg = await asyncio.to_thread(sp_add_blacklist_word, uid, word)
     await e.respond(msg, parse_mode="md")
     # Live update if forwarding is active
     if uid in forward_loops:
-        forward_loops[uid]["blacklist"] = compile_blacklist_for_user(uid)
+        forward_loops[uid]["blacklist"] = await asyncio.to_thread(compile_blacklist_for_user, uid)
 
 @bot.on(events.NewMessage(pattern=r"^/remove_blacklist$"))
 async def remove_blacklist_ui_cmd(e):
     if not await guard_or_hint(e): return
     if not await premium_or_hint(e): return
     uid = e.sender_id
-    rows = sp_list_blacklist(uid)
+    rows = await asyncio.to_thread(sp_list_blacklist, uid)
     if not rows:
         return await e.respond("ℹ️ No blacklisted words set. Add with `/blacklist_word word`.", parse_mode="md")
     # Pairs: index with label
@@ -2338,7 +2485,7 @@ async def start_text_cmd(e):
     if not await premium_or_hint(e): return
     uid = e.sender_id
     text = e.pattern_match.group(1).strip()
-    sp_set_start_text(uid, text)
+    await asyncio.to_thread(sp_set_start_text, uid, text)
     await e.respond(f"✅ Starting text set:\n\n`{text}` \nStart forwarding with **/work**.", parse_mode="md")
 
 
@@ -2365,7 +2512,7 @@ async def end_text_cmd(e):
     if not await premium_or_hint(e): return
     uid = e.sender_id
     text = e.pattern_match.group(1).strip()
-    sp_set_end_text(uid, text)
+    await asyncio.to_thread(sp_set_end_text, uid, text)
     await e.respond(f"✅ Ending text set:\n\n`{text}` \nStart forwarding with **/work**.", parse_mode="md")
 
 
@@ -2374,7 +2521,7 @@ async def remove_text_cmd(e):
     if not await guard_or_hint(e): return
     if not await premium_or_hint(e): return
     uid = e.sender_id
-    sp_remove_texts(uid)
+    await asyncio.to_thread(sp_remove_texts, uid)
     await e.respond("🧹 Removed all saved start and end texts.\nStart forwarding with **/work**.")
 
 
@@ -2405,7 +2552,7 @@ async def delay_cmd(e):
     secs = int(e.pattern_match.group(1))
     if not (0 <= secs <= 999):
         return await e.respond("⚠️ Use: `/delay 0..999` seconds.", parse_mode="md")
-    sp_set_delay(uid, secs)
+    await asyncio.to_thread(sp_set_delay, uid, secs)
     if uid in forward_loops:
         forward_loops[uid]["delay_seconds"] = secs
     await e.respond(f"⏱️ Delay set to **{secs}s**.\nStart forwarding with **/work**.")
@@ -2427,7 +2574,7 @@ async def remove_delay_cmd(e):
             "delay_seconds": 0,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
-        supabase.table("tg_user_settings").upsert(payload, on_conflict="user_id").execute()
+        await asyncio.to_thread(lambda: supabase.table("tg_user_settings").upsert(payload, on_conflict="user_id").execute())
 
         # If forwarding loop is active, update it immediately
         if uid in forward_loops:
@@ -2445,7 +2592,7 @@ async def cmd_plans(e):
     uid = int(e.sender_id)
 
     # --- Subscription status at top ---
-    app_sub = sp_get_app_subscription_by_telegram_user_id(uid)
+    app_sub = await asyncio.to_thread(sp_get_app_subscription_by_telegram_user_id, uid)
     status_block = format_app_plan_block(app_sub)
 
     features_block = (
@@ -2480,7 +2627,7 @@ async def cmd_upgrade(e):
     uid = int(e.sender_id)
 
     # --- Subscription status at top ---
-    app_sub = sp_get_app_subscription_by_telegram_user_id(uid)
+    app_sub = await asyncio.to_thread(sp_get_app_subscription_by_telegram_user_id, uid)
     status_block = format_app_plan_block(app_sub)
 
     # --- Features block (plain text, no plan catalog) ---
@@ -2518,7 +2665,7 @@ async def cmd_upgrade(e):
 @bot.on(events.NewMessage(pattern=r"^/upgrade_status$"))
 async def cmd_upgrade_status(e):
     uid = int(e.sender_id)
-    sub = sp_get_app_subscription_by_telegram_user_id(uid)
+    sub = await asyncio.to_thread(sp_get_app_subscription_by_telegram_user_id, uid)
     await e.respond(format_app_plan_block(sub), parse_mode="md")
 
 
@@ -2532,6 +2679,11 @@ async def cb_upgrade_check(event):
 # ---------------- LOGOUT ----------------
 @bot.on(events.NewMessage(pattern=r"^/logout$"))
 async def logout_cmd(e):
+    if DATABASE_CLIENTS is not None and await session_store.telegram_credential(e.sender_id) is not None:
+        if not e.is_private:
+            return await e.respond("Use a private chat to disconnect Telegram.")
+        return await e.respond("Disconnect Telegram? Your forwarding configuration will be retained.",
+            buttons=[[Button.inline("Disconnect Telegram", data=b"logout_confirm"), Button.inline("Cancel", data=b"logout_cancel")]])
     # /logout is in ALWAYS_ALLOWED (free user ok), but needs to be logged in to actually delete session
     if not await guard_or_hint(e): return
     await e.respond(
@@ -2542,15 +2694,34 @@ async def logout_cmd(e):
                   Button.inline("✖ Cancel", data=b"logout_cancel")]]
     )
 @bot.on(events.CallbackQuery(pattern=b"logout_confirm"))
+@serialize_user_operation
 async def logout_confirm_cb(event):
     uid = event.sender_id
-    data = sp_get_session(uid)
+    if DATABASE_CLIENTS is not None:
+        row = await session_store.telegram_credential(uid)
+        if row is not None:
+            if not event.is_private:
+                return await event.answer("Use a private chat for logout.", alert=True)
+            cached = USER_CLIENT_CACHE.pop(uid, None)
+            if cached:
+                await cached.disconnect()
+            forward_loops.pop(uid, None)
+            EXPLICIT_PAUSED_USERS.add(uid)
+            try:
+                await persist_stopped(uid)
+                await WEB_LOGIN.logout(row["dashboard_owner_id"])
+                return await event.edit("Telegram disconnected. Your forwarding configuration is retained. Use /login to reconnect.")
+            except LoginError as error:
+                return await event.edit(error.message)
+            except Exception:
+                return await event.edit("Unable to save logout intent. Please retry /logout.")
+    data = await asyncio.to_thread(sp_get_session, uid)
     if not data:
         return await event.edit("ℹ️ No session found.")
     if uid in forward_loops:
         try:
             await forward_loops[uid]["client"].disconnect()
-        except:
+        except Exception:
             pass
         forward_loops.pop(uid, None)
 
@@ -2563,7 +2734,7 @@ async def logout_confirm_cb(event):
             os.remove(path)
         except Exception as ex:
             print("remove session file err:", ex)
-    sp_delete_session(uid)
+    await asyncio.to_thread(sp_delete_session, uid)
     await event.edit("👋 Logged out successfully. All your data removed. You can /login again anytime.")
  
 
@@ -2575,6 +2746,22 @@ async def logout_cancel_cb(event):
 async def stoplogin_cmd(e):
     """Cancel any ongoing /login flow for the user."""
     uid = e.sender_id
+    if AUTOFORWARD_WEB_LOGIN:
+        if not e.is_private:
+            return await e.respond("Use a private chat to cancel login.")
+        try:
+            result = await session_store._execute(lambda: supabase.table("profiles").select("id").eq("telegram_user_id", uid).execute())
+            if len(result.data or []) != 1:
+                return await e.respond("No linked login found.")
+            owner = result.data[0]["id"]
+            attempts = await session_store._execute(lambda: supabase.table("tg_autoforward_login_attempts").select("id")
+                .eq("dashboard_owner_id", owner).in_("step", ["preparing", "otp", "password"]).execute())
+            for attempt in attempts.data or []:
+                await WEB_LOGIN.cancel(owner, attempt["id"])
+            await session_store._execute(lambda: supabase.table("tg_autoforward_login_links").update({"superseded_at": datetime.now(timezone.utc).isoformat()}).eq("telegram_owner_id", uid).execute())
+            return await e.respond("Login cancelled. Use /login for a new link.")
+        except LoginError as error:
+            return await e.respond(error.message)
     if uid in login_state:
         login_state.pop(uid, None)
         await e.respond("✖ Login process cancelled. You can start again with /login if you want.")
@@ -2584,6 +2771,8 @@ async def stoplogin_cmd(e):
 
 @bot.on(events.CallbackQuery(pattern=b"resend_otp"))
 async def cb_resend_otp(event):
+    if AUTOFORWARD_WEB_LOGIN:
+        return await event.answer("Request a fresh code on the website, or use /login for a new link.", alert=True)
     uid = event.sender_id
     st = login_state.get(uid)
     if not st or not st.get("phone"):
@@ -2630,14 +2819,14 @@ async def safe_connect(client, retries=3, delay=2):
                 await asyncio.sleep(delay * attempt)
     raise last_exc or RuntimeError("safe_connect: failed to connect")
 
-async def resume_forwarding_on_start():
+async def resume_forwarding_on_start(missing_only=False):
     """
     Bot restart hone par un sab users ka forwarding resume karega 
     jinke user_settings me is_forwarding = true hai.
     """
     print("🔍 Checking which users had forwarding enabled before restart...")
 
-    uids = sp_get_forwarding_users()
+    uids = await asyncio.to_thread(sp_get_forwarding_users)
     if not uids:
         print("ℹ️ No users with forwarding ON previously.")
         return
@@ -2645,6 +2834,8 @@ async def resume_forwarding_on_start():
     print(f"🔁 Resuming forwarding for {len(uids)} user(s): {uids}")
 
     for uid in uids:
+        if missing_only and (uid in forward_loops or uid in EXPLICIT_PAUSED_USERS):
+            continue
         try:
             # Check if user logged-in properly
             try:
@@ -2685,6 +2876,14 @@ async def resume_forwarding_on_start():
 
 
 # ---------------- RUN ----------------
+async def retry_missing_forwarders():
+    while True:
+        await asyncio.sleep(30)
+        try:
+            await resume_forwarding_on_start(missing_only=True)
+        except Exception:
+            print("AutoForward recovery will retry shortly")
+
 if __name__ == "__main__":
     print("🤖 Auto-Forward Login Bot ready!")
     try:
@@ -2697,9 +2896,18 @@ if __name__ == "__main__":
     except Exception as ex:
         print(f"⚠️ Non-fatal error during resume forwarding on start: {ex}")
 
+    retry_task = None
+    if DATABASE_CLIENTS is not None:
+        retry_task = asyncio.get_event_loop().create_task(retry_missing_forwarders())
     try:
         bot.run_until_disconnected()
     except (KeyboardInterrupt, SystemExit):
         print("👋 Bot stopped gracefully.")
     except Exception as ex:
         print(f"❌ Bot disconnected with error: {ex}")
+    finally:
+        if retry_task:
+            retry_task.cancel()
+            asyncio.get_event_loop().run_until_complete(asyncio.gather(retry_task, return_exceptions=True))
+        if DATABASE_CLIENTS is not None:
+            asyncio.get_event_loop().run_until_complete(DATABASE_CLIENTS.shutdown())
