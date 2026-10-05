@@ -8,7 +8,14 @@ from pydantic import BaseModel, Field
 from typing import Optional, List
 from uuid import UUID
 from telethon import TelegramClient, functions, types
-from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, PhoneCodeExpiredError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    AuthKeyDuplicatedError,
+    AuthKeyInvalidError,
+    AuthKeyUnregisteredError,
+)
 from telethon.sessions import StringSession
 from supabase import create_client, Client
 import hashlib
@@ -219,7 +226,34 @@ async def _get_telegram_client(user_id: str, sb: Client = None):
     if user_id in clients:
         client = clients[user_id]
         if not client.is_connected():
-            await client.connect()
+            try:
+                await client.connect()
+            except (AuthKeyDuplicatedError, AuthKeyInvalidError, AuthKeyUnregisteredError) as e:
+                logger.warning(f"Cached client session invalidated for {user_id}: {e}")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                clients.pop(user_id, None)
+            except (OSError, asyncio.TimeoutError, ConnectionError) as e:
+                logger.error(f"Network error connecting cached client for {user_id}: {e}")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                clients.pop(user_id, None)
+                raise HTTPException(
+                    status_code=503,
+                    detail="Temporary network error connecting to Telegram servers. Please retry.",
+                ) from e
+            except Exception as e:
+                logger.error(f"Unexpected error connecting cached client for {user_id}: {e}")
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
+                clients.pop(user_id, None)
+                raise HTTPException(status_code=500, detail=str(e)) from e
         return client
 
     if not API_ID or not API_HASH:
@@ -269,9 +303,13 @@ async def _get_telegram_client(user_id: str, sb: Client = None):
     )
     try:
         await client.connect()
-    except Exception as e:
-        logger.warning(f"Failed to connect client for {user_id}: {e}")
-        # Reset to empty session so endpoint does not fail with 500
+    except (AuthKeyDuplicatedError, AuthKeyInvalidError, AuthKeyUnregisteredError) as e:
+        logger.warning(f"Invalid or duplicated auth key for {user_id}: {e}")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        # Auth key is invalidated by Telegram; fallback to fresh unauthenticated session
         client = TelegramClient(
             StringSession(""),
             int(API_ID),
@@ -281,7 +319,32 @@ async def _get_telegram_client(user_id: str, sb: Client = None):
         try:
             await client.connect()
         except Exception as inner_e:
-            logger.error(f"Failed to connect fallback client for {user_id}: {inner_e}")
+            logger.error(f"Failed to connect fresh client for {user_id}: {inner_e}")
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            raise HTTPException(
+                status_code=503,
+                detail="Unable to connect to Telegram servers. Please retry.",
+            ) from inner_e
+    except (OSError, asyncio.TimeoutError, ConnectionError) as e:
+        logger.error(f"Network failure connecting client for {user_id}: {e}")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        raise HTTPException(
+            status_code=503,
+            detail="Temporary network error connecting to Telegram. Please retry.",
+        ) from e
+    except Exception as e:
+        logger.error(f"Unexpected connection error for {user_id}: {e}")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
     # Auto-migrate legacy file to database StringSession
     try:
@@ -348,6 +411,7 @@ async def get_status(ctx: dict = Depends(get_auth_context)):
     sb = get_authed_supabase(token)
     user_id = user.id
     logger.info(f"Status check for user: {user_id}")
+    client = await get_telegram_client(user_id, sb)
     try:
         is_connected = await client.is_user_authorized()
     except Exception as e:
