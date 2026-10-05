@@ -71,6 +71,7 @@ if AUTOFORWARD_WEB_LOGIN and not AUTOFORWARD_DATABASE_SESSIONS:
 DATABASE_CLIENTS = None
 WEB_LINKS = None
 WEB_LOGIN = None
+CHAT_LOGIN = None
 if AUTOFORWARD_DATABASE_SESSIONS:
     from telegram_common import SessionEncryption
     from telegram_common.autoforward import AutoForwardClients, AutoForwardLogin, AutoForwardStore
@@ -86,6 +87,8 @@ if AUTOFORWARD_DATABASE_SESSIONS:
     DATABASE_CLIENTS = AutoForwardClients(session_store, session_cipher, API_ID, API_HASH, on_loss=on_database_owner_loss)
     WEB_LINKS = AutoForwardLoginLinks(SupabaseLinkStore(supabase), os.getenv("AUTOFORWARD_LOGIN_URL", "https://getaipilot.in/autoforward/login"))
     WEB_LOGIN = AutoForwardLogin(session_store, session_cipher, API_ID, API_HASH)
+    from telegram_common.autoforward_chat import AutoForwardChatLogin
+    CHAT_LOGIN = AutoForwardChatLogin(session_store, WEB_LOGIN)
 USER_CLIENT_LOCKS = {}
 USER_FORWARD_LOCKS = {}
 USER_EVENT_LOCKS = {}
@@ -1315,9 +1318,78 @@ async def status_cmd(e):
     await e.respond(f"🟢 Logged In\n**Phone:** {data['phone']}\n`{data['session_file']}`", parse_mode="md")
 
 # ---------------- LOGIN FLOW (2FA SUPPORTED) ----------------
+async def database_login_prompt(e, step):
+    if step == "phone":
+        login_state[e.sender_id] = {"step": "phone"}
+        return await e.respond("📲 Send your phone number `+919876543210` in this format.\n\nYou can cancel login anytime with `/stoplogin`.")
+    if step == "otp":
+        login_state[e.sender_id] = {"step": "otp"}
+        return await e.respond("📩 Send OTP in this format: `LOGIN123456`.\n\nDidn't get the OTP? Resend by clicking the button 👇\n\nCancel login with `/stoplogin` anytime.",
+            buttons=[[Button.inline("🔁 Resend OTP", data=b"resend_otp")]])
+    if step == "password":
+        login_state[e.sender_id] = {"step": "2fa"}
+        return await e.respond("🔐 2FA enabled. Please enter your **Telegram password**.\n\nYou can cancel login with `/stoplogin`.\n\n_We won't store your password; it's used once to finish login._")
+    login_state.pop(e.sender_id, None)
+    return await e.respond("✅ Logged in. Now set **/incoming** & **/outgoing**, then **/work** to start.")
+
+
+async def database_login_error(e, error):
+    if error.restart:
+        login_state.pop(e.sender_id, None)
+    message = error.message
+    if error.retry_after:
+        message += f" Wait {error.retry_after} seconds."
+    await e.respond(message)
+
+
+async def database_chat_input(e):
+    if not e.is_private or (e.raw_text or "").startswith("/"):
+        return
+    uid = e.sender_id
+    try:
+        row = await CHAT_LOGIN.pending(uid)
+        if row:
+            value = e.raw_text or ""
+            if row["step"] == "otp":
+                match = OTP_RE.match(value.strip())
+                if not match:
+                    return await e.respond("⚠️ Send OTP in `123456` or `LOGIN123456` format.")
+                value = match.group(1)
+            elif row["step"] != "password":
+                return await e.respond("Login is being processed. Please retry shortly.")
+            result = await CHAT_LOGIN.verify(uid, value)
+            return await database_login_prompt(e, "password" if result.get("next") == "password_required" else "done")
+        state = login_state.get(uid)
+        if not state:
+            return
+        if state["step"] != "phone":
+            row = await session_store.telegram_credential(uid)
+            if row and row["state"] == "active":
+                return await database_login_prompt(e, "done")
+            login_state.pop(uid, None)
+            return await e.respond("No login in progress. Use /login.")
+        await CHAT_LOGIN.start(uid, (e.raw_text or "").strip())
+        await database_login_prompt(e, "otp")
+    except LoginError as error:
+        # Ordinary private messages from unlinked users are not login attempts.
+        if error.code != "identity_required" or uid in login_state:
+            await database_login_error(e, error)
+
+
 @bot.on(events.NewMessage(pattern=r"^/login$"))
+@serialize_user_operation
 async def login_cmd(e):
     uid = e.sender_id
+    if CHAT_LOGIN is not None and not AUTOFORWARD_WEB_LOGIN:
+        if not e.is_private:
+            return await e.respond("Open a private chat with this bot to login.")
+        try:
+            if await is_logged_in(uid):
+                return await e.respond("✅ **Already logged in.**\nSet chats: **/incoming** & **/outgoing**\nStart forwarding: **/work**")
+            row = await CHAT_LOGIN.pending(uid)
+            return await database_login_prompt(e, row["step"] if row else "phone")
+        except LoginError as error:
+            return await database_login_error(e, error)
     if AUTOFORWARD_WEB_LOGIN:
         if not e.is_private:
             return await e.respond("Open a private chat with this bot to login.")
@@ -1350,9 +1422,12 @@ async def login_cmd(e):
 
 
 @bot.on(events.NewMessage)
+@serialize_user_operation
 async def login_flow(e):
     if AUTOFORWARD_WEB_LOGIN:
         return
+    if CHAT_LOGIN is not None:
+        return await database_chat_input(e)
     uid = e.sender_id
     msg = (e.raw_text or "").strip()
     if uid not in login_state:
@@ -2743,9 +2818,19 @@ async def logout_cancel_cb(event):
     await event.edit("✖ Logout cancelled. You are still logged in.")
 
 @bot.on(events.NewMessage(pattern=r"^/stoplogin$"))
+@serialize_user_operation
 async def stoplogin_cmd(e):
     """Cancel any ongoing /login flow for the user."""
     uid = e.sender_id
+    if CHAT_LOGIN is not None and not AUTOFORWARD_WEB_LOGIN:
+        if not e.is_private:
+            return await e.respond("Use a private chat to cancel login.")
+        try:
+            cancelled = await CHAT_LOGIN.cancel(uid)
+            cancelled = bool(login_state.pop(uid, None)) or cancelled
+            return await e.respond("✖ Login process cancelled. You can start again with /login if you want." if cancelled else "ℹ️ No login in progress.")
+        except LoginError as error:
+            return await database_login_error(e, error)
     if AUTOFORWARD_WEB_LOGIN:
         if not e.is_private:
             return await e.respond("Use a private chat to cancel login.")
@@ -2770,9 +2855,19 @@ async def stoplogin_cmd(e):
 
 
 @bot.on(events.CallbackQuery(pattern=b"resend_otp"))
+@serialize_user_operation
 async def cb_resend_otp(event):
     if AUTOFORWARD_WEB_LOGIN:
         return await event.answer("Request a fresh code on the website, or use /login for a new link.", alert=True)
+    if CHAT_LOGIN is not None:
+        await event.answer()
+        if not event.is_private:
+            return
+        try:
+            await CHAT_LOGIN.resend(event.sender_id)
+            return await database_login_prompt(event, "otp")
+        except LoginError as error:
+            return await database_login_error(event, error)
     uid = event.sender_id
     st = login_state.get(uid)
     if not st or not st.get("phone"):

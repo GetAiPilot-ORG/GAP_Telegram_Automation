@@ -1,5 +1,39 @@
 # AutoForward database sessions — milestone 3
 
+## Current scope — 2026-10-05
+
+The existing bot-chat phone/OTP/2FA flow now supports database-backed login.
+No website login or new dashboard deployment is required for that flow. Keep:
+
+```env
+AUTOFORWARD_DATABASE_SESSIONS=true
+AUTOFORWARD_WEB_LOGIN=false
+```
+
+Set these only in the AutoForward bot environment after the migrations and
+encryption/service-role settings below are available. Backend web-login can
+remain false. Defaults remain off for controlled rollout; no deployment has
+been performed as part of this work.
+
+Private `/login`, numeric or `LOGIN123456` codes, password prompts, resend and
+`/stoplogin` retain their bot-chat interface. Pending OTP/password attempts are
+encrypted in the database and resume after a restart. Only the initial phone
+prompt is in memory; if the worker restarts before a phone is submitted, send
+`/login` again. No new user session file is created by this path. OTP/password
+values are never written to database attempts or bot memory state.
+
+Each sender must have exactly one linked dashboard profile. Phone login must
+authenticate that same Telegram account. Unlinked/ambiguous identities fail
+before requesting a code. Existing session files still need the explicit,
+stopped-worker migration below; neither login nor tests delete them.
+
+The internal identity grant reuses existing restricted AutoForward link RPCs;
+the four existing Telegram migrations suffice. No additional schema migration
+is needed for bot-chat login. The website instructions below are optional and
+are outside the requested bot-chat flow. Join/Tracker, AI Chatbot and Broadcast
+remain untouched and outside this project's current migration scope. The
+AutoForward command bot retains its own session file.
+
 Status: implemented and locally verified. Production AutoForward migrations,
 configuration, account migration and real Telegram checks remain deployment work.
 Flags default to false. No production credentials were migrated here.

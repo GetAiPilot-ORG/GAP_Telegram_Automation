@@ -1,5 +1,68 @@
 # AutoForward verification — 2026-10-03
 
+Cleanup note (2026-10-05): migration-specific test suites and disposable test
+artifacts were removed at the user's request after verification. Results below
+are historical; test commands and fixture paths no longer exist in this checkout.
+Runtime credentials/session files and implementation code were preserved.
+
+## Completion — 2026-10-05, bot-chat flow
+
+The gap identified in the recheck below is now fixed. In database mode with
+website login disabled, existing phone/OTP/password prompts call
+`telegram_common/autoforward_chat.py` and the durable AutoForward runtime.
+The handler bypasses file creation and filename persistence for new logins.
+Pending OTP/2FA attempts resume after restart; resend replaces the hash/session
+atomically; cancellation works without in-memory state. Invalid passwords remain
+retryable. Expired attempts can be cancelled/restarted. Identity checks reject
+unlinked, ambiguous or incorrect Telegram accounts before credentials are saved.
+
+Current verification: **78 shared tests passed with no skips**, using a fresh
+disposable PostgreSQL 16 instance and dummy identities; **3 existing backend
+tests passed**. The 78 include 13 isolated bot handler tests and four new
+database chat-flow scenarios. Package-wheel build, inclusion of the new adapter,
+Python compilation and whitespace checks passed. No frontend changes were
+needed; the October 3 browser results below are historical, not rerun here.
+
+Local bot configuration retains `AUTOFORWARD_DATABASE_SESSIONS=true` and now
+sets `AUTOFORWARD_WEB_LOGIN=false`; backend AutoForward web-login is also false.
+No running bot was restarted, no real login was performed and nothing was
+deployed. Existing local session files were neither read nor changed by these
+checks. Their already-present working-tree changes belong to the user's local
+activity. Apply the existing AutoForward migrations/configuration to the chosen
+environment before running this feature. No new SQL migration is required.
+
+The initial phone prompt still requires `/login` again if a restart occurs
+before phone submission. OTP/password values are passed through only and are
+not stored in database state or bot memory state. Existing accounts require
+explicit file migration or retain the legacy compatibility path until then.
+The AutoForward command bot retains its own session. Join/Tracker, AI Chatbot
+and Broadcast remain unchanged and outside scope. Telegram delivery and real
+account behavior still need a controlled real-account check when authorized.
+
+## Recheck — 2026-10-05, revised scope
+
+The user requires the existing bot-chat phone/OTP/password flow and has excluded
+Join/Tracker, AI Chatbot and Broadcast from this migration. No deployment is
+authorized until the scoped work is finished.
+
+AutoForward is **not complete for this revised requirement**. Its `login_flow`
+still creates `TelegramClient(session_path(...))` and calls `sp_upsert_session`
+to record filenames after phone/OTP/password authentication. The database-aware
+worker and website login do not convert new bot-chat logins. The command bot
+also retains its own SQLite session. Existing local session files must be kept.
+
+The current offline suite ran 67 tests: 30 passed and 37 database integration
+tests were skipped because the disposable PostgreSQL socket was unavailable.
+All three backend login-state regression tests passed. These results do not
+replace the October 3 database/browser checks or establish production readiness.
+
+Submanager's durable backend endpoints and dashboard attempt restoration remain
+implemented. The remaining AutoForward requirement is database-backed bot-chat
+login with unchanged prompts, including restart, resend, cancellation, identity
+checks and logout coverage. Other bot runners remain outside the authorized scope.
+
+## Original website-flow verification
+
 Implementation complete for milestone 3 user sessions. Production rollout is
 pending. No production Telegram credentials or Supabase data were modified by
 these checks. New feature flags remain disabled by default.

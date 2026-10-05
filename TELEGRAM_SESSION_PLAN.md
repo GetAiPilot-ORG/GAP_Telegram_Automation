@@ -1,5 +1,16 @@
 # Telegram session storage and login implementation plan
 
+## Scope update — 2026-10-05
+
+Current work is limited to Submanager and AutoForward user-account sessions.
+AutoForward keeps the existing bot-chat phone/OTP/2FA prompts with database
+storage (`AUTOFORWARD_DATABASE_SESSIONS=true`, `AUTOFORWARD_WEB_LOGIN=false`).
+The database-backed chat adapter is implemented, including restart recovery,
+resend, cancel and verified Telegram identity. Website login remains optional.
+Join/Tracker, AI Chatbot and Broadcast migrations are deferred at the user's
+request; the bot-runner milestone below is historical scope, not authorized
+current work. No further deployment is authorized until the user chooses it.
+
 Status: foundation and Submanager migrations applied by the user; compatible
 Submanager backend/frontend deployed. User confirmed login and refresh work;
 two-step password and logout verification remain pending.

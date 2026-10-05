@@ -14,6 +14,20 @@ class AutoForwardStore(SupabaseLoginStore):
     def __init__(self, client):
         super().__init__(client, "autoforward")
 
+    async def chat_owner(self, telegram_id):
+        result = await self._execute(lambda: self.client.table("profiles").select("id")
+            .eq("telegram_user_id", telegram_id).execute())
+        rows = result.data or []
+        if len(rows) != 1:
+            raise LoginError("identity_required", "Connect your dashboard account to this Telegram account first.", 409)
+        return rows[0]["id"]
+
+    async def chat_attempt(self, owner):
+        result = await self._execute(lambda: self.client.table("tg_autoforward_login_attempts").select("*")
+            .eq("dashboard_owner_id", owner).in_("step", ["preparing", "otp", "password"])
+            .order("created_at", desc=True).limit(1).execute())
+        return (result.data or [None])[0]
+
     async def telegram_credential(self, telegram_id):
         response = await self._execute(lambda: self.client.table("tg_session_credentials").select("*")
             .eq("telegram_owner_id", telegram_id).eq("purpose", "autoforward").eq("principal_kind", "user")
