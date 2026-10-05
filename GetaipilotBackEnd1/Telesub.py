@@ -267,18 +267,32 @@ async def _get_telegram_client(user_id: str, sb: Client = None):
         API_HASH,
         flood_sleep_threshold=10,
     )
-    await client.connect()
+    try:
+        await client.connect()
+    except Exception as e:
+        logger.warning(f"Failed to connect client for {user_id}: {e}")
+        # Reset to empty session so endpoint does not fail with 500
+        client = TelegramClient(
+            StringSession(""),
+            int(API_ID),
+            API_HASH,
+            flood_sleep_threshold=10,
+        )
+        try:
+            await client.connect()
+        except Exception as inner_e:
+            logger.error(f"Failed to connect fallback client for {user_id}: {inner_e}")
 
     # Auto-migrate legacy file to database StringSession
-    if is_legacy_file and await client.is_user_authorized() and sb:
-        try:
+    try:
+        if is_legacy_file and await client.is_user_authorized() and sb:
             new_session_string = StringSession.save(client.session)
             sb.table("tg_accounts").update({
                 "session_file": new_session_string
             }).eq("user_id", user_id).execute()
             logger.info(f"Auto-migrated legacy session file to database for {user_id}")
-        except Exception as e:
-            logger.error(f"Failed to auto-migrate legacy session for {user_id}: {e}")
+    except Exception as e:
+        logger.error(f"Failed to check auth/migrate legacy session for {user_id}: {e}")
 
     clients[user_id] = client
     if encrypted_row:
@@ -334,9 +348,11 @@ async def get_status(ctx: dict = Depends(get_auth_context)):
     sb = get_authed_supabase(token)
     user_id = user.id
     logger.info(f"Status check for user: {user_id}")
-    client = await get_telegram_client(user_id, sb)
-
-    is_connected = await client.is_user_authorized()
+    try:
+        is_connected = await client.is_user_authorized()
+    except Exception as e:
+        logger.warning(f"Failed to check authorization for {user_id}: {e}")
+        is_connected = False
     phone = None
     if is_connected:
         try:
@@ -365,7 +381,12 @@ async def login_start(request: PhoneRequest, ctx: dict = Depends(get_auth_contex
     logger.info("Login start for user: %s", user_id)
     client = await get_telegram_client(user_id, sb)
 
-    if await client.is_user_authorized():
+    try:
+        already_authed = await client.is_user_authorized()
+    except Exception:
+        already_authed = False
+
+    if already_authed:
         logger.info(f"User {user_id} already connected")
         return {"status": "already_connected"}
 
