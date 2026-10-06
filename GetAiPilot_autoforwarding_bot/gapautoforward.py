@@ -2939,29 +2939,15 @@ async def resume_forwarding_on_start(missing_only=False):
                 print(f"⚠️ Cannot resume forwarding for {uid}: login error -> {ex}")
                 continue
 
-            # User ko info de do ki forwarding dobara start ho gayi
-            try:
-                await bot.send_message(
-                    uid,
-                    "🔄 Bot restarted.\n"
-                    "▶️ Forwarding started again automatically for your chats."
-                )
-            except Exception as ex:
-                print(f"⚠️ Could not send message to {uid}: {ex}")
-
-            # `/work` ko background se run karo, lekin jo bhi /work respond karega
-            # woh REAL user chat me hi jayega (terminal pe nahi)
+            # Background recovery must never DM users, including retry errors.
+            # Real /work events still send their normal command responses.
             class FakeEvent:
                 sender_id = uid
                 raw_text = "/work"
 
                 async def respond(self, *args, **kwargs):
-                    # /work normally e.respond(...) use karta hai,
-                    # hum usko bridge kar rahe hain bot.send_message se.
-                    try:
-                        await bot.send_message(self.sender_id, *args, **kwargs)
-                    except Exception as ex:
-                        print(f"⚠️ FakeEvent respond warning for {self.sender_id}: {ex}")
+                    message = args[0] if args else kwargs.get("message", "")
+                    print(f"AutoForward recovery for user {self.sender_id}: {message}")
 
             await cmd_work(FakeEvent())
 
