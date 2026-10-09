@@ -606,28 +606,4 @@ class Repository:
             logger.debug(f"[PRIVATE-BROADCAST] Could not fetch custom welcome message: {ex}")
             return None
 
-    async def get_custom_goodbye_message(self, owner_id: Optional[Any] = None, bot_id: Optional[str] = None) -> Optional[str]:
-        """
-        Fetch goodbye/opt-out message configured in telegram_private_broadcast_bots.
-        """
-        try:
-            if bot_id and bot_id != "default":
-                res = await self.supabase.table("telegram_private_broadcast_bots").select("goodbye_message").eq("id", bot_id).limit(1).execute()
-                data = getattr(res, "data", []) or []
-                if data and data[0].get("goodbye_message"):
-                    return data[0]["goodbye_message"]
-
-            if owner_id:
-                aliases = await self.get_owner_aliases(owner_id)
-                for a in aliases:
-                    if len(a) == 36 and a.count("-") == 4:
-                        res = await self.supabase.table("telegram_private_broadcast_bots").select("goodbye_message").eq("user_id", a).limit(1).execute()
-                        data = getattr(res, "data", []) or []
-                        if data and data[0].get("goodbye_message"):
-                            return data[0]["goodbye_message"]
-
-            return None
-        except Exception as ex:
-            logger.debug(f"[PRIVATE-BROADCAST] Could not fetch custom goodbye message: {ex}")
-            return None
 

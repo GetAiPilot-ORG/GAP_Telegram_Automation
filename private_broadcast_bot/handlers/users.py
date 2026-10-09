@@ -1,5 +1,7 @@
 from typing import Optional, Any
+import asyncio
 from telethon import events
+from config import logger
 from services.subscriber_service import SubscriberService
 
 def register_user_handlers(
@@ -34,7 +36,7 @@ def register_user_handlers(
                 owner_id = f"-{s_owner}"
 
         user = await evt.get_sender()
-        response_text = await subscriber_service.register_subscriber(
+        response_texts = await subscriber_service.register_subscriber(
             telegram_user_id=evt.sender_id,
             chat_id=evt.chat_id,
             username=getattr(user, "username", None),
@@ -43,7 +45,27 @@ def register_user_handlers(
             owner_id=owner_id,
             bot_id=bot_id
         )
-        await evt.respond(response_text)
+        if isinstance(response_texts, list):
+            for i, msg in enumerate(response_texts):
+                if i > 0:
+                    await asyncio.sleep(2)
+                if msg:
+                    try:
+                        await evt.respond(msg)
+                    except Exception as e:
+                        logger.warning(f"[PRIVATE-BROADCAST] Markdown parse error on msg, falling back to plain text: {e}")
+                        try:
+                            await evt.respond(msg, parse_mode=None)
+                        except Exception as e2:
+                            logger.error(f"[PRIVATE-BROADCAST] Failed to send msg: {e2}")
+        else:
+            try:
+                await evt.respond(response_texts)
+            except Exception as e:
+                try:
+                    await evt.respond(response_texts, parse_mode=None)
+                except Exception:
+                    pass
 
     @bot.on(events.NewMessage(pattern=r"^/stop$"))
     async def handle_stop(evt):
