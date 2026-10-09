@@ -42,7 +42,7 @@ class SubscriberService:
                 return [custom_msg]
             return [WELCOME_MESSAGE]
         else:
-            return ["⚠️ An error occurred while processing your subscription. Please try again later."]
+            return []
 
     async def opt_out_subscriber(self, telegram_user_id: int, owner_id: Optional[Any] = None, bot_id: Optional[str] = None) -> str:
         """
